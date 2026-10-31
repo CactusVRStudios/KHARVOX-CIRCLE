@@ -1,0 +1,40 @@
+#pragma once
+
+// A second opinion from the view frustum for the lights Umbra hides (Steam build 25216728 and Game Pass
+// 1.0.56.0).
+//
+// With Umbra culling on, the game's per-view light gather (RVA 0x1C782C0 on Steam) never tests a light
+// against the view frustum: a light is drawn only when Umbra reported its light object visible (gate A), or,
+// for a light with no Umbra object, when its box passed Umbra's occlusion buffer (gate B), and then, for some
+// kept lights, when a sphere around them passed Umbra's test too. From some camera positions Umbra hides a
+// light whose light falls on what the camera sees, and the light is dropped: at the steps up to the Fortress
+// of Doom's command dais the steps, the floor and the weapon go dark one step down and bright one step up
+// (docs/rig-findings/umbra-lights.md). With r_useUmbraCulling 0 the gather takes a frustum test instead and
+// the lighting is right, but the whole frame loses Umbra's culling (about half the frame rate on the test
+// PC).
+//
+// This keeps every light Umbra keeps and sends only the lights it hides to that frustum test: mid hooks at
+// the three drops resume at the frustum path, and a hook at its verdict sends a light the frustum drops too
+// to the drop of the gate that asked. A light is dropped only when both say hidden. (The first version took
+// Umbra's verdict away and gave every light the frustum test alone, so a light Umbra kept could be dropped by
+// the frustum.) Geometry, decals and areas keep Umbra.
+//
+// On by default; KHARVOX_CIRCLE_LIGHT_FRUSTUM=0 turns it off. Only while the multiplayer guard is armed
+// (checked at install and on every hidden light) and only on a build it was read on (light_cull_builds.hpp:
+// PE timestamp, signature at that build's RVA, and the code at every offset used); otherwise it logs why and
+// leaves the game untouched.
+
+#include <string_view>
+
+namespace circlevr::vkcore {
+
+// Whether KHARVOX_CIRCLE_LIGHT_FRUSTUM asks for the fix: only the value "0" turns it off; unset, empty and any
+// other value leave it on. `set` is false when the variable is not set.
+constexpr bool lightFrustumWanted(bool set, std::wstring_view value) {
+    return !(set && value == L"0");
+}
+
+// Hooks the light gather once per process unless turned off; later calls return the first result.
+bool installLightFrustumCull();
+
+} // namespace circlevr::vkcore

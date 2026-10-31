@@ -1,0 +1,312 @@
+# The Vulkan implicit layer DLL (ARCHITECTURE sections 4 and 7). Windows only.
+
+include(CircleVrVulkanHeaders)
+include(CircleVrOpenXr)
+include(CircleVrSafetyHook)
+
+# The mid-function hook wrapper is the only code that sees safetyhook, which needs C++23.
+add_library(circle_vr_mid_hook STATIC mid_hook.cpp)
+target_include_directories(circle_vr_mid_hook PUBLIC "${PROJECT_SOURCE_DIR}/src")
+target_compile_features(circle_vr_mid_hook PRIVATE cxx_std_23)
+target_compile_definitions(circle_vr_mid_hook PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(circle_vr_mid_hook PRIVATE circle_vr_warnings circle_vr_safetyhook)
+
+# The device feature chain edit is its own library so its tests can link it without the layer.
+add_library(circle_vr_device_features STATIC device_features.cpp)
+target_include_directories(circle_vr_device_features PUBLIC "${PROJECT_SOURCE_DIR}/src")
+target_compile_features(circle_vr_device_features PUBLIC cxx_std_20)
+target_compile_definitions(circle_vr_device_features PUBLIC VK_NO_PROTOTYPES)
+target_link_libraries(circle_vr_device_features PRIVATE circle_vr_warnings PUBLIC Vulkan::Headers)
+
+# The debug command schedule (debug_commands.cpp), tested without the game.
+add_library(circle_vr_debug_script STATIC debug_script.cpp)
+target_include_directories(circle_vr_debug_script PUBLIC "${PROJECT_SOURCE_DIR}/src")
+target_compile_features(circle_vr_debug_script PUBLIC cxx_std_20)
+target_link_libraries(circle_vr_debug_script PRIVATE circle_vr_warnings circle_vr_mp_policy)
+
+# Pure helpers of the shader dump, tested without a device.
+add_library(circle_vr_dump_format STATIC dump_format.cpp)
+target_include_directories(circle_vr_dump_format PUBLIC "${PROJECT_SOURCE_DIR}/src")
+target_compile_features(circle_vr_dump_format PUBLIC cxx_std_20)
+target_compile_definitions(circle_vr_dump_format PUBLIC VK_NO_PROTOTYPES)
+target_link_libraries(circle_vr_dump_format PRIVATE circle_vr_warnings PUBLIC Vulkan::Headers)
+
+# The game settings line (game_settings.cpp): its cvars, text and schedule, tested without the game.
+add_library(circle_vr_game_settings_line STATIC game_settings_line.cpp)
+target_include_directories(circle_vr_game_settings_line PUBLIC "${PROJECT_SOURCE_DIR}/src")
+target_compile_features(circle_vr_game_settings_line PUBLIC cxx_std_20)
+target_link_libraries(circle_vr_game_settings_line PRIVATE circle_vr_warnings)
+
+# Parallel Eye Rendering's switch and what it selects (parallel_eyes_settings.hpp), tested without the game.
+add_library(circle_vr_parallel_eyes_settings STATIC parallel_eyes_settings.cpp)
+target_include_directories(circle_vr_parallel_eyes_settings PUBLIC "${PROJECT_SOURCE_DIR}/src")
+target_compile_features(circle_vr_parallel_eyes_settings PUBLIC cxx_std_20)
+target_link_libraries(circle_vr_parallel_eyes_settings PUBLIC circle_vr_stereo_seq PRIVATE circle_vr_warnings)
+
+add_library(circle_vr_layer SHARED
+    backdrop_probe.cpp
+    bin_tile_hooks.cpp
+    body_follow.cpp
+    bug_capture.cpp
+    camera_anim_hook.cpp
+    cb_check.cpp
+    cb_view_skip.cpp
+    cinema_view.cpp
+    client_rect.cpp
+    climb_hook.cpp
+    cpu_timing.cpp
+    cvar_book.cpp
+    debug_commands.cpp
+    demon_aim.cpp
+    demon_view.cpp
+    facing_hook.cpp
+    flare_core.cpp
+    flare_views.cpp
+    device_augment.cpp
+    dlss_dll.cpp
+    dlss_menu_hooks.cpp
+    eye_capture.cpp
+    exposure_hooks.cpp
+    frame_pacing.cpp
+    game_build.cpp
+    game_code.cpp
+    game_settings.cpp
+    game_text.cpp
+    glory_view.cpp
+    gpu_timing.cpp
+    gpu_timing_report.cpp
+    head_sweep.cpp
+    import_patch.cpp
+    keep_active.cpp
+    key_inject.cpp
+    layer_entry.cpp
+    light_cull.cpp
+    log.cpp
+    mirror_place.cpp
+    keep_prev_hooks.cpp
+    geomcache_prev_hooks.cpp
+    fx_gpu_stages.cpp
+    fx_sync_hooks.cpp
+    motion_capture.cpp
+    moved_flag_hooks.cpp
+    mp_guard.cpp
+    object_prev_hooks.cpp
+    vis_gate_hooks.cpp
+    world_gui_hooks.cpp
+    player_aim.cpp
+    presenter_alt.cpp
+    presenter_copy.cpp
+    presenter_fade.cpp
+    presenter_mirror.cpp
+    presenter_reticle.cpp
+    presenter_result.cpp
+    presenter_swapchains.cpp
+    presenter_vignette.cpp
+    presenter_window.cpp
+    ring_trace.cpp
+    window_timing.cpp
+    runtime_cvars.cpp
+    runtime_cvars_pe.cpp
+    pe_flares.cpp
+    pe_flare_contexts.cpp
+    pe_flare_guard.cpp
+    presenter_eyes.cpp
+    fence_wait.cpp
+    presenter_frame.cpp
+    presenter_frame_log.cpp
+    presenter_clock.cpp
+    pose_guards.cpp
+    presenter_fov.cpp
+    presenter_cutscene.cpp
+    presenter_head.cpp
+    presenter_latch.cpp
+    presenter_ring.cpp
+    presenter_seq.cpp
+    presenter_snapshot.cpp
+    presenter_stereo.cpp
+    presenter_ui.cpp
+    presenter_wrist.cpp
+    presenter_reconnect.cpp
+    presenter_refresh.cpp
+    presenter_xr.cpp
+    presenter_xr_events.cpp
+    queue_entry.cpp
+    refraction_hooks.cpp
+    refraction_locate.cpp
+    room_follow.cpp
+    room_posture.cpp
+    reticle_depth.cpp
+    room_scale.cpp
+    save_hook.cpp
+    scatter_hooks.cpp
+    seq_alternate.cpp
+    seq_eye_fixes.cpp
+    seq_hooks.cpp
+    seq_render_counter.cpp
+    seq_locate.cpp
+    seq_prev.cpp
+    seq_stack.cpp
+    shader_dump.cpp
+    shader_dump_record.cpp
+    ssdo_hooks.cpp
+    ssdo_menu_hook.cpp
+    stall_watch.cpp
+    status_file.cpp
+    stereo_hooks.cpp
+    stereo_present.cpp
+    surface_entry.cpp
+    swapchain_entry.cpp
+    taa_env.cpp
+    taa_debug_cvars.cpp
+    taa_hooks.cpp
+    taa_ssr.cpp
+    taa_locate.cpp
+    taa_ngx.cpp
+    taa_resize.cpp
+    test_cpu_load.cpp
+    test_keys.cpp
+    ui_capture.cpp
+    ui_engine.cpp
+    ui_vulkan.cpp
+    ui_wash.cpp
+    view_async.cpp
+    view_binning.cpp
+    view_block.cpp
+    view_clone_binds.cpp
+    view_clone_census.cpp
+    view_clone_make.cpp
+    view_clone_map.cpp
+    view_clone_stencil.cpp
+    view_clones.cpp
+    view_contexts.cpp
+    view_dlss.cpp
+    view_redirects.cpp
+    view_hook.cpp
+    view_install.cpp
+    view_jobs.cpp
+    view_one_passes.cpp
+    view_query_copy.cpp
+    view_shadow_cache.cpp
+    view_shared_state.cpp
+    view_skin_alloc.cpp
+    view_slots.cpp
+    view_snapshot.cpp
+    view_snapshot_frames.cpp
+    view_snapshot_pairs.cpp
+    view_snapshot_ring.cpp
+    view_snapshot_stats.cpp
+    view_swap_guard.cpp
+    view_swap_watch.cpp
+    view_updates.cpp
+    view_water.cpp
+    view_water_sites.cpp
+    present_scaling.cpp
+    virtual_client.cpp
+    virtual_client_settings.cpp
+    vram_watch.cpp
+    window_cap.cpp
+    xr_presenter.cpp)
+# Motion controllers (M5, controllers.hpp).
+target_sources(circle_vr_layer PRIVATE
+    action_aim_hook.cpp
+    aim_hooks.cpp
+    bhaptics_ammo.cpp
+    bhaptics_game.cpp
+    bhaptics_launch.cpp
+    bhaptics_link.cpp
+    bhaptics_portal.cpp
+    control_map.cpp
+    controller_test.cpp
+    controllers.cpp
+    equipment_launch_hook.cpp
+    game_view_poses.cpp
+    haptics_xr.cpp
+    input_profiles.cpp
+    input_watch.cpp
+    input_xr.cpp
+    game_arm.cpp
+    game_arm_joints.cpp
+    hands_surfaces.cpp
+    offhand_hook.cpp
+    offhand_mods.cpp
+    weapon_arm.cpp
+    prompt_hooks.cpp
+    rest_wheel.cpp
+    rumble_hook.cpp
+    touch_buttons_log.cpp
+    usercmd_hook.cpp
+    viewmodel_hook.cpp
+    vrs_command_buffers.cpp
+    vrs_gui.cpp
+    vrs_marks.cpp
+    vrs_nv.cpp
+    vrs_pass_eye.cpp
+    vrs_rate_images.cpp
+    xinput_hook.cpp
+    xr_runtime.cpp)
+# Menus on a panel with a laser pointer (M6, docs/VR_MENUS.md).
+target_sources(circle_vr_layer PRIVATE
+    menu_cursor.cpp
+    menu_cursor_hide.cpp
+    menu_input.cpp
+    menu_model_hook.cpp
+    presenter_menu.cpp)
+target_link_libraries(circle_vr_layer PRIVATE circle_vr_arm circle_vr_bhaptics circle_vr_comfort circle_vr_flares circle_vr_foveation circle_vr_input circle_vr_menu circle_vr_pacing circle_vr_roomscale circle_vr_tracking)
+set_target_properties(circle_vr_layer PROPERTIES OUTPUT_NAME KharvoxCircle)
+target_compile_features(circle_vr_layer PRIVATE cxx_std_20)
+target_compile_definitions(circle_vr_layer PRIVATE
+    VK_NO_PROTOTYPES
+    VK_USE_PLATFORM_WIN32_KHR
+    XR_USE_PLATFORM_WIN32
+    XR_USE_GRAPHICS_API_D3D12
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX)
+target_link_libraries(circle_vr_layer PRIVATE
+    circle_vr_warnings
+    circle_vr_debug_script
+    circle_vr_device_features
+    circle_vr_dlss_dll
+    circle_vr_dump_format
+    circle_vr_game_settings_line
+    circle_vr_parallel_eyes_settings
+    circle_vr_gpu_timing
+    circle_vr_layer_gate
+    circle_vr_key_injection
+    circle_vr_mid_hook
+    circle_vr_mp_policy
+    circle_vr_render_size
+    circle_vr_resolver
+    circle_vr_stereo_seq
+    circle_vr_ui_layer
+    circle_vr_xr_math
+    Vulkan::Headers
+    circle_vr_openxr_headers
+    d3d12
+    dxgi
+    version)
+# The manifest sits next to the DLL and refers to it by a relative path, which the loader resolves
+# against the manifest's own directory. That lets the launcher register the build output directly.
+# openxr_loader.dll is loaded from the same folder.
+set(CIRCLE_VR_LAYER_LIBRARY_NAME "KharvoxCircle.dll")
+configure_file(VK_LAYER_CIRCLE_VR.json.in "${CMAKE_CURRENT_BINARY_DIR}/VK_LAYER_KHARVOX_CIRCLE.json" @ONLY)
+
+# The version resource the launcher checks against its own version (ROADMAP M4.5, "User data and
+# updates"). A Debug build is marked -dev, which the launcher only warns about.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(CIRCLE_VR_PRODUCT_VERSION "${PROJECT_VERSION}-dev")
+    set(CIRCLE_VR_VERSION_FLAGS "VS_FF_DEBUG|VS_FF_PRERELEASE")
+else()
+    set(CIRCLE_VR_PRODUCT_VERSION "${PROJECT_VERSION}")
+    set(CIRCLE_VR_VERSION_FLAGS "0")
+endif()
+configure_file(version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/circlevr_version.rc" @ONLY)
+target_sources(circle_vr_layer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/circlevr_version.rc")
+set_source_files_properties(status_file.cpp PROPERTIES COMPILE_DEFINITIONS "CIRCLE_VR_LAYER_VERSION=\"${CIRCLE_VR_PRODUCT_VERSION}\"")
+add_custom_command(TARGET circle_vr_layer POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${CMAKE_CURRENT_BINARY_DIR}/VK_LAYER_KHARVOX_CIRCLE.json"
+        "$<TARGET_FILE_DIR:circle_vr_layer>/VK_LAYER_KHARVOX_CIRCLE.json"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${CIRCLE_VR_OPENXR_LOADER_DLL}"
+        "$<TARGET_FILE_DIR:circle_vr_layer>/openxr_loader.dll"
+    VERBATIM)

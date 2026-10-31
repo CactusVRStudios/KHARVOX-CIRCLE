@@ -1,0 +1,11 @@
+circle_vr_add_module(circle_vr_foveation
+    SOURCES
+        attachment_images.cpp
+        eye_shape_latch.cpp
+        eye_targets.cpp
+        foveation_preset.cpp
+        foveation_region.cpp
+        rate_pattern.cpp
+    DEPENDS
+        circle_vr_common
+        circle_vr_xr_math)

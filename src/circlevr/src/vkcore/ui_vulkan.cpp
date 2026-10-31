@@ -1,0 +1,426 @@
+#include "motor/sequential.hpp"
+#include "framegen/fidelityfx.hpp"
+#include "vkcore/ui_vulkan.hpp"
+
+#include "ui_layer/layout_tracker.hpp"
+#include "ui_layer/motion_target.hpp"
+#include "ui_layer/ui_settings.hpp"
+#include "vkcore/log.hpp"
+#include "vkcore/mp_guard.hpp"
+#include "vkcore/presenter_eyes.hpp"
+#include "vkcore/shader_dump.hpp"
+#include "vkcore/view_snapshot.hpp"
+#include "vkcore/vrs_nv.hpp"
+
+#include <array>
+#include <atomic>
+#include <cstring>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace circlevr::vkcore::ui_vulkan {
+
+namespace {
+
+using DispatchKey = void*;
+
+template <typename Handle>
+DispatchKey keyOf(Handle handle) {
+    return *reinterpret_cast<void**>(handle);
+}
+
+template <typename Handle>
+ui_layer::LayoutTracker::Handle handleValue(Handle handle) {
+    return reinterpret_cast<ui_layer::LayoutTracker::Handle>(handle);
+}
+
+struct UiDevice {
+    PFN_vkCreateImage createImage = nullptr;
+    PFN_vkDestroyImage destroyImage = nullptr;
+    PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
+    PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
+    PFN_vkCmdExecuteCommands cmdExecuteCommands = nullptr;
+    PFN_vkQueueSubmit queueSubmit = nullptr;
+    bool isGame = false; // other devices (a runtime's own) pass straight through
+};
+
+// Allocated once and never destroyed (see layer_entry.cpp: no teardown at process exit).
+std::shared_mutex& g_devicesMutex = *new std::shared_mutex;
+auto& g_devices = *new std::unordered_map<DispatchKey, UiDevice>;
+std::mutex& g_recordsMutex = *new std::mutex;
+auto& g_records = *new std::unordered_map<VkImage, ui_layer::ImageRecord>;
+ui_layer::LayoutTracker& g_tracker = *new ui_layer::LayoutTracker;
+std::atomic<std::uint64_t> g_candidates{0};
+std::atomic<std::uint64_t> g_motionCandidates{0};
+std::atomic<std::uint64_t> g_motionNotFollowed{0};
+std::atomic<std::uint64_t> g_notFollowed{0};
+std::atomic<std::uint64_t> g_watchChanges{0};
+// The one image whose layout is followed: the GUI target the game uses now (set from the present hook).
+std::atomic<ui_layer::LayoutTracker::Handle> g_watched{0};
+
+const UiDevice* deviceOf(DispatchKey key) {
+    std::shared_lock lock(g_devicesMutex);
+    const auto it = g_devices.find(key);
+    return it == g_devices.end() ? nullptr : &it->second;
+}
+
+bool readEnabled() {
+    std::vector<std::string> warnings;
+    const ui_layer::UiSettings s = ui_layer::readUiSettings(
+        [](std::wstring_view name) -> std::optional<std::wstring> {
+            std::wstring value;
+            if (!readEnv(std::wstring(name).c_str(), value)) {
+                return std::nullopt;
+            }
+            return value;
+        },
+        warnings);
+    return s.enabled;
+}
+
+// ---- Hooks ---------------------------------------------------------------------------------------------
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateImage(VkDevice device,
+                                           const VkImageCreateInfo* pCreateInfo,
+                                           const VkAllocationCallbacks* pAllocator,
+                                           VkImage* pImage) {
+    const UiDevice* d = deviceOf(keyOf(device));
+    ui_layer::ImageCreateDesc desc;
+    desc.imageType = pCreateInfo->imageType;
+    desc.format = pCreateInfo->format;
+    desc.width = pCreateInfo->extent.width;
+    desc.height = pCreateInfo->extent.height;
+    desc.depth = pCreateInfo->extent.depth;
+    desc.mipLevels = pCreateInfo->mipLevels;
+    desc.arrayLayers = pCreateInfo->arrayLayers;
+    desc.samples = pCreateInfo->samples;
+    desc.usage = pCreateInfo->usage;
+    const bool touch = d->isGame && (circle::motor::sequential::requested() || mp_guard::allowsGameTouch());
+    std::optional<std::uint32_t> usage = touch ? ui_layer::candidateUsage(desc) : std::nullopt;
+    // The motion-vector capture: every image that could be a velocity target is prepared and followed.
+    const bool motion = !usage && touch && motionCaptureRequested() && ui_layer::motionCandidateUsage(desc);
+    if (motion) {
+        usage = ui_layer::motionCandidateUsage(desc);
+    }
+    // Parallel Eye Rendering's eye copy reads each view's image (presenter_eyes.hpp).
+    if (!usage && touch && eyeCopyRequested()) {
+        usage = ui_layer::eyeCopyCandidateUsage(desc);
+    }
+    // Track exact native image formats/usage for the FSR input handoff.
+    const bool fsrRecordOnly = !usage && touch && circle::fg::fidelityRequested() &&
+        desc.imageType == VK_IMAGE_TYPE_2D && desc.depth == 1 && desc.mipLevels == 1 &&
+        desc.arrayLayers == 1 && desc.samples == VK_SAMPLE_COUNT_1_BIT;
+    if (fsrRecordOnly) usage = desc.usage;
+    if (!usage) {
+        return d->createImage(device, pCreateInfo, pAllocator, pImage);
+    }
+    VkImageCreateInfo info = *pCreateInfo;
+    info.usage = *usage;
+    const VkResult result = d->createImage(device, &info, pAllocator, pImage);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    ui_layer::ImageRecord record;
+    record.format = info.format;
+    record.width = info.extent.width;
+    record.height = info.extent.height;
+    record.usage = info.usage;
+    record.sharingMode = info.sharingMode;
+    if (info.sharingMode == VK_SHARING_MODE_CONCURRENT && info.pQueueFamilyIndices) {
+        record.queueFamilies.assign(info.pQueueFamilyIndices,
+                                    info.pQueueFamilyIndices + info.queueFamilyIndexCount);
+    }
+    {
+        std::lock_guard lock(g_recordsMutex);
+        g_records[*pImage] = record;
+    }
+    if (motion) {
+        // Followed only once the capture finds it bound as velocity (follow()): the game makes many such
+        // images.
+        if (++g_motionCandidates <= 8) {
+            CIRCLE_VR_LOG("motion: image %p (%ux%u, format %d, usage 0x%X) prepared for copying",
+                    reinterpret_cast<void*>(*pImage), info.extent.width, info.extent.height, info.format,
+                    info.usage);
+        }
+        return result;
+    }
+    if (fsrRecordOnly) return result;
+    const std::uint64_t n = ++g_candidates;
+    if (n <= 8) {
+        CIRCLE_VR_LOG("ui: image %p (%ux%u RGBA8 render target, sharing %s over %u famil%s) prepared for copying",
+                reinterpret_cast<void*>(*pImage), info.extent.width, info.extent.height,
+                info.sharingMode == VK_SHARING_MODE_CONCURRENT ? "concurrent" : "exclusive",
+                info.queueFamilyIndexCount, info.queueFamilyIndexCount == 1 ? "y" : "ies");
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL DestroyImage(VkDevice device,
+                                        VkImage image,
+                                        const VkAllocationCallbacks* pAllocator) {
+    const UiDevice* d = deviceOf(keyOf(device));
+    if (image != VK_NULL_HANDLE) {
+        bool known = false;
+        {
+            std::lock_guard lock(g_recordsMutex);
+            known = g_records.erase(image) != 0;
+        }
+        if (known) {
+            g_tracker.removeCandidate(handleValue(image));
+            auto expected = handleValue(image);
+            g_watched.compare_exchange_strong(expected, 0);
+        }
+    }
+    d->destroyImage(device, image, pAllocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(VkCommandBuffer commandBuffer,
+                                              VkPipelineStageFlags srcStageMask,
+                                              VkPipelineStageFlags dstStageMask,
+                                              VkDependencyFlags dependencyFlags,
+                                              std::uint32_t memoryBarrierCount,
+                                              const VkMemoryBarrier* pMemoryBarriers,
+                                              std::uint32_t bufferMemoryBarrierCount,
+                                              const VkBufferMemoryBarrier* pBufferMemoryBarriers,
+                                              std::uint32_t imageMemoryBarrierCount,
+                                              const VkImageMemoryBarrier* pImageMemoryBarriers) {
+    // The eye snapshots follow barriers with Parallel Eye Rendering only: Route S pays one cached check.
+    const bool snapshots = view_snapshot::enabled();
+    for (std::uint32_t i = 0; i < imageMemoryBarrierCount; ++i) {
+        g_tracker.onBarrier(handleValue(commandBuffer), handleValue(pImageMemoryBarriers[i].image),
+                            pImageMemoryBarriers[i].newLayout);
+        if (snapshots) {
+            view_snapshot::noteBarrier(commandBuffer, pImageMemoryBarriers[i]);
+        }
+    }
+    deviceOf(keyOf(commandBuffer))
+        ->cmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags, memoryBarrierCount,
+                             pMemoryBarriers, bufferMemoryBarrierCount, pBufferMemoryBarriers,
+                             imageMemoryBarrierCount, pImageMemoryBarriers);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer commandBuffer,
+                                                  const VkCommandBufferBeginInfo* pBeginInfo) {
+    g_tracker.onBegin(handleValue(commandBuffer));
+    if (view_snapshot::enabled()) {
+        view_snapshot::noteBegin(commandBuffer);
+    }
+    return deviceOf(keyOf(commandBuffer))->beginCommandBuffer(commandBuffer, pBeginInfo);
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdExecuteCommands(VkCommandBuffer commandBuffer,
+                                              std::uint32_t commandBufferCount,
+                                              const VkCommandBuffer* pCommandBuffers) {
+    std::vector<ui_layer::LayoutTracker::Handle> secondaries(commandBufferCount);
+    for (std::uint32_t i = 0; i < commandBufferCount; ++i) {
+        secondaries[i] = handleValue(pCommandBuffers[i]);
+    }
+    g_tracker.onExecute(handleValue(commandBuffer), secondaries.data(), secondaries.size());
+    deviceOf(keyOf(commandBuffer))->cmdExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue queue,
+                                           std::uint32_t submitCount,
+                                           const VkSubmitInfo* pSubmits,
+                                           VkFence fence) {
+    const UiDevice* d = deviceOf(keyOf(queue));
+    // With a frame's view 0 or view 1 screen pass in one of the batches, a batch after them copies its
+    // image (view_snapshot.hpp).
+    std::optional<view_snapshot::Append> copy = d->isGame && view_snapshot::enabled()
+                                                    ? view_snapshot::submitted(queue, submitCount, pSubmits)
+                                                    : std::nullopt;
+    VkResult result = VK_SUCCESS;
+    if (copy) {
+        const std::array<VkPipelineStageFlags, 3> stages{
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT};
+        std::vector<VkSubmitInfo> batches(pSubmits, pSubmits + submitCount);
+        std::vector<VkSemaphore> signals(copy->signals.begin(), copy->signals.begin() + copy->signalCount);
+        std::vector<std::uint64_t> values(copy->signalValues.begin(),
+                                          copy->signalValues.begin() + copy->signalCount);
+        // With an eye 0 copy the game's signals from `moveFrom` on go after it (view_snapshot.hpp): each such
+        // batch keeps its waits and command buffers, and its timeline info (if any) its wait values.
+        std::vector<VkTimelineSemaphoreSubmitInfo> kept(submitCount);
+        for (std::uint32_t s = copy->moveFrom; s < submitCount; ++s) {
+            const auto* own = static_cast<const VkTimelineSemaphoreSubmitInfo*>(batches[s].pNext);
+            for (std::uint32_t i = 0; i < batches[s].signalSemaphoreCount; ++i) {
+                signals.push_back(batches[s].pSignalSemaphores[i]);
+                values.push_back(own && i < own->signalSemaphoreValueCount ? own->pSignalSemaphoreValues[i]
+                                                                           : 0);
+            }
+            batches[s].signalSemaphoreCount = 0;
+            batches[s].pSignalSemaphores = nullptr;
+            if (own) {
+                kept[s] = *own;
+                kept[s].signalSemaphoreValueCount = 0;
+                kept[s].pSignalSemaphoreValues = nullptr;
+                batches[s].pNext = &kept[s];
+            }
+        }
+        VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        timeline.waitSemaphoreValueCount = copy->waitCount;
+        timeline.pWaitSemaphoreValues = copy->waitValues.data();
+        timeline.signalSemaphoreValueCount = static_cast<std::uint32_t>(values.size());
+        timeline.pSignalSemaphoreValues = values.data();
+        VkSubmitInfo& after = batches.emplace_back(VkSubmitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline});
+        after.waitSemaphoreCount = copy->waitCount;
+        after.pWaitSemaphores = copy->waits.data();
+        after.pWaitDstStageMask = stages.data();
+        after.commandBufferCount = copy->cbCount;
+        after.pCommandBuffers = copy->cbs.data();
+        after.signalSemaphoreCount = static_cast<std::uint32_t>(signals.size());
+        after.pSignalSemaphores = signals.data();
+        result = d->queueSubmit(queue, static_cast<std::uint32_t>(batches.size()), batches.data(), fence);
+        view_snapshot::copiesSubmitted(*copy, result == VK_SUCCESS);
+        copy.reset(); // the next copies may take their timeline values now
+    } else {
+        result = d->queueSubmit(queue, submitCount, pSubmits, fence);
+    }
+    if (result == VK_SUCCESS) {
+        std::vector<ui_layer::LayoutTracker::Handle> cbs;
+        for (std::uint32_t s = 0; s < submitCount; ++s) {
+            for (std::uint32_t i = 0; i < pSubmits[s].commandBufferCount; ++i) {
+                cbs.push_back(handleValue(pSubmits[s].pCommandBuffers[i]));
+            }
+        }
+        g_tracker.onSubmit(handleValue(queue), cbs.data(), cbs.size());
+    }
+    return result;
+}
+
+} // namespace
+
+bool enabled() {
+    static const bool on = readEnabled();
+    return on;
+}
+
+bool motionCaptureRequested() {
+    static const bool on = [] {
+        std::wstring value;
+        return readEnv(L"KHARVOX_CIRCLE_CAPTURE_MOTION", value) && !value.empty();
+    }();
+    return on;
+}
+
+void onDeviceCreated(VkDevice device, PFN_vkGetDeviceProcAddr nextGetDeviceProcAddr, bool isGame) {
+    if (!enabled()) {
+        return;
+    }
+    UiDevice d;
+    d.isGame = isGame;
+    d.createImage = reinterpret_cast<PFN_vkCreateImage>(nextGetDeviceProcAddr(device, "vkCreateImage"));
+    d.destroyImage = reinterpret_cast<PFN_vkDestroyImage>(nextGetDeviceProcAddr(device, "vkDestroyImage"));
+    d.cmdPipelineBarrier =
+        reinterpret_cast<PFN_vkCmdPipelineBarrier>(nextGetDeviceProcAddr(device, "vkCmdPipelineBarrier"));
+    // The shader dump hooks these two as well, and foveation vkBeginCommandBuffer: with them on, ours calls
+    // the dump's, which calls foveation's, which calls the next.
+    const auto chained = [&](const char* name) {
+        const PFN_vkVoidFunction dump = shader_dump::findHook(name);
+        const PFN_vkVoidFunction vrs = dump ? nullptr : vrs_nv::findHook(name);
+        return dump ? dump : vrs ? vrs : nextGetDeviceProcAddr(device, name);
+    };
+    d.beginCommandBuffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(chained("vkBeginCommandBuffer"));
+    d.cmdExecuteCommands = reinterpret_cast<PFN_vkCmdExecuteCommands>(chained("vkCmdExecuteCommands"));
+    d.queueSubmit = reinterpret_cast<PFN_vkQueueSubmit>(nextGetDeviceProcAddr(device, "vkQueueSubmit"));
+    if (!d.createImage || !d.destroyImage || !d.cmdPipelineBarrier || !d.beginCommandBuffer ||
+        !d.cmdExecuteCommands || !d.queueSubmit) {
+        // Every hook needs its next function; a device without one would crash in them.
+        CIRCLE_VR_LOG("ui: a device function is missing; this device is not changed or followed");
+        d.isGame = false;
+    }
+    {
+        std::unique_lock lock(g_devicesMutex);
+        g_devices[keyOf(device)] = d;
+    }
+    if (d.isGame) {
+        CIRCLE_VR_LOG("ui: UI layer on: images created like the GUI target get TRANSFER_SRC, their layouts are "
+                "followed");
+    }
+}
+
+void onDeviceDestroyed(VkDevice device) {
+    std::unique_lock lock(g_devicesMutex);
+    g_devices.erase(keyOf(device));
+}
+
+PFN_vkVoidFunction findHook(const char* name) {
+    if (!enabled()) {
+        return nullptr;
+    }
+#define CIRCLE_VR_UI_HOOK(fn)                                                                                      \
+    if (std::strcmp(name, "vk" #fn) == 0) {                                                                  \
+        return reinterpret_cast<PFN_vkVoidFunction>(&fn);                                                    \
+    }
+    CIRCLE_VR_UI_HOOK(CreateImage)
+    CIRCLE_VR_UI_HOOK(DestroyImage)
+    CIRCLE_VR_UI_HOOK(CmdPipelineBarrier)
+    CIRCLE_VR_UI_HOOK(BeginCommandBuffer)
+    CIRCLE_VR_UI_HOOK(CmdExecuteCommands)
+    CIRCLE_VR_UI_HOOK(QueueSubmit)
+#undef CIRCLE_VR_UI_HOOK
+    return nullptr;
+}
+
+std::optional<ui_layer::ImageRecord> recordOf(VkImage image) {
+    std::lock_guard lock(g_recordsMutex);
+    const auto it = g_records.find(image);
+    if (it == g_records.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+void watch(VkImage image) {
+    const auto value = handleValue(image);
+    if (g_watched.load() == value) {
+        return;
+    }
+    const auto previous = g_watched.exchange(value);
+    if (previous != 0) {
+        g_tracker.removeCandidate(previous);
+    }
+    if (!g_tracker.addCandidate(value)) {
+        ++g_notFollowed;
+    }
+    if (++g_watchChanges <= 8) {
+        CIRCLE_VR_LOG("ui: GUI target is image %p; its layout is followed from here",
+                reinterpret_cast<void*>(image));
+    }
+}
+
+VkImage guiTarget() {
+    return reinterpret_cast<VkImage>(g_watched.load(std::memory_order_relaxed));
+}
+
+bool follow(VkImage image) {
+    const auto value = handleValue(image);
+    if (g_tracker.isCandidate(value)) {
+        return true;
+    }
+    if (!recordOf(image)) {
+        return false;
+    }
+    if (!g_tracker.addCandidate(value)) {
+        ++g_motionNotFollowed;
+        return false;
+    }
+    return true;
+}
+
+std::optional<ImageState> stateOf(VkImage image) {
+    const auto s = g_tracker.stateOf(handleValue(image));
+    if (!s) {
+        return std::nullopt;
+    }
+    return ImageState{static_cast<VkImageLayout>(s->layout), reinterpret_cast<VkQueue>(s->queue)};
+}
+
+Counters counters() {
+    return Counters{g_candidates.load(), g_notFollowed.load(), g_watchChanges.load(),
+                    g_motionCandidates.load(), g_motionNotFollowed.load()};
+}
+
+} // namespace circlevr::vkcore::ui_vulkan

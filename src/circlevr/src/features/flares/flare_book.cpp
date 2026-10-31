@@ -1,0 +1,70 @@
+#include "features/flares/flare_book.hpp"
+
+#include <algorithm>
+
+namespace circlevr::flares {
+
+bool plausible(const FlareRecord& record) {
+    return record.model != 0 && record.vertices != 0 && record.quads > 0 && record.halves >= 1 &&
+           record.halves <= FlareBook::kHalves && record.quads <= kMaxQuads / record.halves &&
+           record.vertices % 16 == 0;
+}
+
+std::uintptr_t vertexEnd(const FlareRecord& record) {
+    return halfStart(record, 1);
+}
+
+std::uintptr_t halfStart(const FlareRecord& record, int half) {
+    return record.vertices +
+           static_cast<std::uintptr_t>(half) * static_cast<std::uintptr_t>(record.quads) * kQuadBytes;
+}
+
+void FlareBook::startRender(const RenderKey& key) {
+    if (hasKey_ && taken_ == 0 && count_ > 0) {
+        ++notTaken_;
+    }
+    key_ = key;
+    hasKey_ = true;
+    taken_ = 0;
+    count_ = 0;
+}
+
+AddResult FlareBook::add(const RenderKey& key, const FlareRecord& record) {
+    if (hasKey_ && key.view == key_.view && static_cast<std::int32_t>(key.frame - key_.frame) < 0) {
+        return AddResult::Late; // an older render of this view, after a newer one started
+    }
+    if (!hasKey_ || !(key == key_)) {
+        startRender(key);
+    }
+    if (taken_ != 0) {
+        return AddResult::Late;
+    }
+    const FlareRecord* const begin = records_;
+    const FlareRecord* const end = begin + count_;
+    if (std::find_if(begin, end, [&](const FlareRecord& r) { return r.model == record.model; }) != end) {
+        return AddResult::Duplicate;
+    }
+    if (count_ == kCapacity) {
+        return AddResult::Full;
+    }
+    records_[count_++] = record;
+    return AddResult::Added;
+}
+
+TakeResult FlareBook::take(const RenderKey& key, int half, std::span<FlareRecord> out) {
+    TakeResult result;
+    if (!hasKey_ || !(key == key_)) {
+        result.otherRender = hasKey_ && taken_ == 0 && count_ > 0;
+        return result;
+    }
+    const unsigned bit = 1u << (half & 1);
+    if (half < 0 || half >= kHalves || (taken_ & bit) != 0) {
+        return result;
+    }
+    taken_ |= bit;
+    result.count = std::min(count_, out.size());
+    std::copy_n(records_, result.count, out.begin());
+    return result;
+}
+
+} // namespace circlevr::flares

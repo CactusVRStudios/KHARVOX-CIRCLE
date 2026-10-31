@@ -1,0 +1,14 @@
+circle_vr_add_module(circle_vr_roomscale
+    SOURCES
+        body_follow.cpp
+        driven_offset.cpp
+        eye_separation.cpp
+        follow_test_steps.cpp
+        head_fade.cpp
+        head_offset.cpp
+        long_press.cpp
+        room_anchor.cpp
+        roomscale_settings.cpp
+    DEPENDS
+        circle_vr_common
+        circle_vr_posture)

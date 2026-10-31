@@ -1,0 +1,12 @@
+circle_vr_add_module(circle_vr_arm
+    SOURCES
+        arm_frames.cpp
+        arm_skeleton.cpp
+        arm_solve.cpp
+        arm_surfaces.cpp
+        hand_offset.cpp
+        mod_room.cpp
+        two_bone_ik.cpp
+    DEPENDS
+        circle_vr_common
+        circle_vr_xr_math)

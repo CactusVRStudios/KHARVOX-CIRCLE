@@ -1,0 +1,253 @@
+// OpenXR session events on the XR worker: session state changes (a failed xrBeginSession is made again), a
+// lost runtime or instance, a LOCAL space change (a recenter), a refresh rate change (presenter_refresh.hpp),
+// and placing the flat screen in front of the head.
+
+#include "vkcore/presenter_impl.hpp"
+#include "motor/experimental.hpp"
+
+#include "vkcore/frame_pacing.hpp"
+#include "vkcore/keep_active.hpp"
+#include "vkcore/pose_guards.hpp"
+#include "vkcore/status_file.hpp"
+#include "xr_math/cinema_quad.hpp"
+
+#include <algorithm>
+#include <optional>
+
+namespace circlevr::vkcore {
+
+namespace {
+
+// After a reference space change the tracked positions' guards take every position this long past the
+// change's time (pose_guards.hpp).
+constexpr XrDuration kGuardOpenNs = 1'000'000'000;
+
+// The session ended: tracking stops and the worker leaves its frame loop, to reconnect when the loss allows
+// it (presenter_reconnect.cpp). The first cause is the one kept.
+void markLost(XrPresenter::Impl& p, xr_recovery::Loss kind, const char* what) {
+    if (!p.loss.lost) {
+        p.loss.kind = kind;
+        if (xr_recovery::recovers(kind)) {
+            status::waiting(
+                "the headset disconnected or its runtime stopped: reconnect it or start the runtime "
+                "again (VR comes back by itself)");
+            CIRCLE_VR_LOG("xr: %s (%s); the game continues flat until the headset is back", what,
+                    xr_recovery::lossName(kind));
+        } else {
+            status::flat("the headset runtime closed VR for the game; quit the game and start again from the "
+                         "launcher");
+            CIRCLE_VR_LOG("xr: %s; the runtime asked to leave VR, the game continues flat", what);
+        }
+    }
+    p.trackingReady.store(false);
+    disableKeepActive();
+    frame_pacing::setUnfocused(false);
+    p.sessionRunning = false;
+    p.loss.lost = true;
+}
+
+// READY: the session starts showing frames. A call that fails without a loss is made again from
+// pollEvents, then the session is made again; a loss makes it again at once. Both are bounded
+// (xr_recovery::afterBeginFailure), so a runtime that fails every begin does not cycle for good.
+void beginSession(XrPresenter::Impl& p) {
+    XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
+    begin.primaryViewConfigurationType = p.viewConfig;
+    const XrResult r = p.xr.xrBeginSession(p.session, &begin);
+    // Already running: an earlier call went through after all.
+    p.sessionRunning = XR_SUCCEEDED(r) || r == XR_ERROR_SESSION_RUNNING;
+    CIRCLE_VR_LOG("xr: xrBeginSession: %d", static_cast<int>(r));
+    p.loss.beginFailedQpc = 0;
+    if (p.sessionRunning) {
+        p.loss.beginFailures = 0;
+        p.loss.runningSinceQpc = qpcNow();
+        status::waiting(p.standaloneDiagnostic ? "XR diagnostic session running; waiting for visible image submission" : "XR session running; waiting for VDXR to allow visible game image submission");
+        p.refresh.onSessionRunning(p.session);
+        if (p.settings.keepActive) {
+            enableKeepActive();
+        }
+        return;
+    }
+    const bool lost =
+        r == XR_ERROR_SESSION_LOST || r == XR_ERROR_INSTANCE_LOST || r == XR_ERROR_RUNTIME_FAILURE;
+    const std::uint32_t failures = ++p.loss.beginFailures;
+    char text[XR_MAX_RESULT_STRING_SIZE];
+    switch (xr_recovery::afterBeginFailure(failures, p.loss.beginRestarts, lost)) {
+    case xr_recovery::BeginNext::Retry:
+        p.loss.beginFailedQpc = qpcNow();
+        CIRCLE_VR_LOG("xr: xrBeginSession failed: %s; trying again in %u s (%u of %u)", p.xrText(r, text),
+                xr_recovery::kBeginRetryMs / 1000, failures + 1, xr_recovery::kBeginTries);
+        break;
+    case xr_recovery::BeginNext::Restart:
+        ++p.loss.beginRestarts;
+        CIRCLE_VR_LOG("xr: xrBeginSession failed %u time(s) (%s); ending the session to start a new one (%u of %u)",
+                failures, p.xrText(r, text), p.loss.beginRestarts, xr_recovery::kBeginRestarts);
+        p.loseOnRuntimeFailure(lost ? r : XR_ERROR_SESSION_LOST, "xrBeginSession");
+        status::waiting("the headset runtime did not start VR for the game; trying again with a new session");
+        break;
+    case xr_recovery::BeginNext::GiveUp:
+        CIRCLE_VR_LOG(
+            "xr: xrBeginSession failed %u time(s) (%s); the session was started again %u times already, so "
+            "the game stays flat",
+            failures, p.xrText(r, text), xr_recovery::kBeginRestarts);
+        if (lost) {
+            p.loss.beginGaveUp = true;
+            p.loseOnRuntimeFailure(r, "xrBeginSession");
+        }
+        status::flat(
+            "the headset runtime would not start VR for the game; restart the runtime, then the game");
+        break;
+    }
+}
+
+} // namespace
+
+bool XrPresenter::Impl::loseOnRuntimeFailure(XrResult result, const char* call) {
+    if (result != XR_ERROR_SESSION_LOST && result != XR_ERROR_INSTANCE_LOST &&
+        result != XR_ERROR_RUNTIME_FAILURE) {
+        return false;
+    }
+    char text[XR_MAX_RESULT_STRING_SIZE];
+    char what[160];
+    std::snprintf(what, sizeof(what), "%s: %s", call, xrText(result, text));
+    markLost(*this,
+             result == XR_ERROR_SESSION_LOST ? xr_recovery::Loss::Session : xr_recovery::Loss::Instance,
+             what);
+    return true;
+}
+
+void XrPresenter::Impl::pollEvents() {
+    XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
+    XrResult polled = XR_SUCCESS;
+    while ((polled = xr.xrPollEvent(instance, &event)) == XR_SUCCESS) {
+        switch (event.type) {
+        case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+            const auto& changed = reinterpret_cast<const XrEventDataSessionStateChanged&>(event);
+            sessionState = changed.state;
+            if (sessionState != XR_SESSION_STATE_VISIBLE && sessionState != XR_SESSION_STATE_FOCUSED) {
+                quadPlaced=false;
+                quadReadiness.trackedSince=0;
+            }
+            sessionFocused.store(sessionState == XR_SESSION_STATE_FOCUSED, std::memory_order_relaxed);
+            CIRCLE_VR_LOG("xr: session state %d", static_cast<int>(sessionState));
+            if (sessionState == XR_SESSION_STATE_READY) {
+                clock.wasFocused = false;
+                clock.watch.reset();
+                clock.gaps.restart();
+            } else if (sessionState == XR_SESSION_STATE_FOCUSED) {
+                clock.wasFocused = true;
+            }
+            // A runtime's menu or dashboard over the game, or the game hidden after it: keep-active keeps the
+            // game running, so it is held to the display rate meanwhile (public issue #19).
+            frame_pacing::setUnfocused(clock.wasFocused && (sessionState == XR_SESSION_STATE_VISIBLE ||
+                                                            sessionState == XR_SESSION_STATE_SYNCHRONIZED));
+            if (sessionState == XR_SESSION_STATE_READY) {
+                loss.beginFailures = 0;
+                beginSession(*this);
+            } else if (sessionState == XR_SESSION_STATE_STOPPING) {
+                updateMotorMenu(0,nullptr);
+                trackingReady.store(false);
+                disableKeepActive();
+                xr.xrEndSession(session);
+                sessionRunning = false;
+                CIRCLE_VR_LOG("xr: session ended");
+            } else if (sessionState == XR_SESSION_STATE_EXITING) {
+                markLost(*this, xr_recovery::Loss::Exiting, "session exiting");
+            } else if (sessionState == XR_SESSION_STATE_LOSS_PENDING) {
+                markLost(*this, xr_recovery::Loss::Session, "session loss pending");
+            }
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
+            refresh.onRateChanged(reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB&>(event));
+            break;
+        case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+            markLost(*this, xr_recovery::Loss::Instance, "instance loss pending");
+            break;
+        case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
+            const auto& change = reinterpret_cast<const XrEventDataReferenceSpaceChangePending&>(event);
+            // A tracked position's jump up to a moment after the change is the runtime's move, not a glitch.
+            pose_guards::resetAll(std::max(change.changeTime, nextDisplayTime.load()) + kGuardOpenNs);
+            if (change.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL) {
+                // The floor's spaces: a floor that moves is not used for the posture until it is back.
+                const bool floor = change.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE ||
+                                   change.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR;
+                if (floor) {
+                    room.onFloorChange();
+                }
+                CIRCLE_VR_LOG("xr: reference space %d change pending%s",
+                        static_cast<int>(change.referenceSpaceType), floor ? "; watching the floor" : "");
+                break;
+            }
+            quadPlaced = false;
+            quadReadiness.referenceChanged(change.changeTime);
+            circle::motor::experimental::recenterAt(change.changeTime);
+            placeAttempts = 0;
+            menuReplace.store(true, std::memory_order_relaxed);
+            const XrPosef& p = change.poseInPreviousSpace;
+            // The room follows the runtime's move, then re-anchors heading, position and height on the head;
+            // the posture stays (the runtime may have moved its floor too).
+            room.onSpaceChange(change.poseValid
+                                   ? std::optional<Pose>(Pose{Quat{p.orientation.x, p.orientation.y,
+                                                                   p.orientation.z, p.orientation.w},
+                                                              Vec3{p.position.x, p.position.y, p.position.z}})
+                                   : std::nullopt);
+            CIRCLE_VR_LOG("xr: LOCAL change pending (pose %s: (%.3f %.3f %.3f)); re-placing the screen and "
+                    "re-anchoring the room",
+                    change.poseValid ? "valid" : "not given", p.position.x, p.position.y, p.position.z);
+            break;
+        }
+        default:
+            break;
+        }
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+    if (polled != XR_EVENT_UNAVAILABLE) {
+        loseOnRuntimeFailure(polled, "xrPollEvent");
+    }
+    // A failed xrBeginSession, made again while the session is still READY.
+    if (!loss.lost && !sessionRunning && loss.beginFailedQpc != 0 && sessionState == XR_SESSION_STATE_READY &&
+        qpcSeconds(qpcNow() - loss.beginFailedQpc) * 1000.0 >= xr_recovery::kBeginRetryMs) {
+        beginSession(*this);
+    }
+    // KHARVOX_CIRCLE_TEST_XR_LOSS: the running session taken as lost once, as a headset going away would be.
+    if (settings.testLossSeconds > 0.0f && !loss.testLossDone && sessionRunning &&
+        qpcSeconds(qpcNow() - loss.runningSinceQpc) >= settings.testLossSeconds) {
+        loss.testLossDone = true;
+        ComPtr<ID3D12Device5> device5;
+        if (settings.testLossRemovesDevice && SUCCEEDED(d3dDevice.As(&device5))) {
+            CIRCLE_VR_LOG("xr: test: removing the presenter's D3D12 device (KHARVOX_CIRCLE_TEST_XR_LOSS_REMOVE)");
+            device5->RemoveDevice();
+        }
+        loseOnRuntimeFailure(XR_ERROR_SESSION_LOST, "test (KHARVOX_CIRCLE_TEST_XR_LOSS)");
+    }
+}
+
+void XrPresenter::Impl::placeQuad(XrTime time) {
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    if (XR_FAILED(xr.xrLocateSpace(viewSpace, localSpace, time, &location))) {
+        quadReadiness.trackedSince=0;
+        return;
+    }
+    constexpr XrSpaceLocationFlags needed =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
+        XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+    const bool visible=sessionState==XR_SESSION_STATE_VISIBLE || sessionState==XR_SESSION_STATE_FOCUSED;
+    if (!quadReadiness.ready(time,visible,(location.locationFlags & needed)==needed)) {
+        if (++placeAttempts == 90) {
+            CIRCLE_VR_LOG("xr: waiting for 250 ms of tracked head pose; temporary screen stays at eye height in VIEW");
+        }
+        return;
+    }
+    kharvox::CinewindowAnchor anchor;
+    const auto& q=location.pose.orientation;
+    const auto& p=location.pose.position;
+    if (!kharvox::captureCinewindowAnchor(anchor,q.x,q.y,q.z,q.w,p.x,p.y,p.z)) return;
+    const auto placed=kharvox::fixedCinewindowLayerPose(anchor,kScreenDistanceMetres);
+    quadPose.orientation = {placed.orientationX,placed.orientationY,placed.orientationZ,placed.orientationW};
+    quadPose.position = {placed.positionX,placed.positionY,placed.positionZ};
+    quadPlaced = true;
+    CIRCLE_VR_LOG("xr: screen placed at (%.2f, %.2f, %.2f) in LOCAL; tracked head height %.2f, upright yaw, 250 ms settled", quadPose.position.x, quadPose.position.y,
+            quadPose.position.z,p.y);
+}
+
+} // namespace circlevr::vkcore

@@ -1,0 +1,575 @@
+// The shared ring: D3D12 images and fence created with NT handles, imported into the game's Vulkan
+// device (T-040, T-080), and rebuilt when the game's swapchain changes shape.
+
+#include "features/pacing/slot_choice.hpp"
+#include "vkcore/fence_wait.hpp"
+#include "vkcore/presenter_impl.hpp"
+
+#include "vkcore/frame_pacing.hpp"
+#include "vkcore/status_file.hpp"
+
+#include <algorithm>
+#include <array>
+
+namespace circlevr::vkcore {
+
+bool XrPresenter::Impl::importRing(const std::array<HANDLE, kRingSize>& imageHandles, HANDLE fenceHandle) {
+    const InstanceDispatch& ivk = dev.instance->vk;
+
+    // Import support for D3D12 resources in this format and usage (T-080).
+    VkPhysicalDeviceExternalImageFormatInfo externalInfo{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO};
+    externalInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+    VkPhysicalDeviceImageFormatInfo2 formatInfo{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+                                                &externalInfo};
+    formatInfo.format = ringFormat;
+    formatInfo.type = VK_IMAGE_TYPE_2D;
+    formatInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    VkExternalImageFormatProperties externalProps{VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+    VkImageFormatProperties2 formatProps{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &externalProps};
+    // Also a copy source when the import allows it (the in-headset capture of both eyes reads the slot).
+    VkResult r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    VkImageUsageFlags usage = 0;
+    const VkImageUsageFlags usages[] = {VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    for (const VkImageUsageFlags u : usages) {
+        formatInfo.usage = u;
+        r = ivk.GetPhysicalDeviceImageFormatProperties2(dev.physicalDevice, &formatInfo, &formatProps);
+        if (r == VK_SUCCESS && (externalProps.externalMemoryProperties.externalMemoryFeatures &
+                                VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)) {
+            usage = u;
+            break;
+        }
+    }
+    const VkExternalMemoryFeatureFlags memFeatures =
+        externalProps.externalMemoryProperties.externalMemoryFeatures;
+    CIRCLE_VR_LOG("presenter: D3D12 resource import for format %d: result %d, features 0x%x%s", ringFormat, r,
+            memFeatures,
+            usage == 0                                  ? ""
+            : (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ? " (copy source too)"
+                                                        : " (not as a copy source: no capture of both eyes)");
+    if (usage == 0) {
+        return false;
+    }
+
+    VkPhysicalDeviceMemoryProperties memProps{};
+    ivk.GetPhysicalDeviceMemoryProperties(dev.physicalDevice, &memProps);
+
+    // What an import attempt made: released when it fails part way, before a retry or the failure.
+    const auto releaseSlots = [&] {
+        for (RingSlot& slot : ring) {
+            if (slot.image) {
+                dev.vk.DestroyImage(dev.device, slot.image, nullptr);
+                slot.image = VK_NULL_HANDLE;
+            }
+            if (slot.memory) {
+                dev.vk.FreeMemory(dev.device, slot.memory, nullptr);
+                slot.memory = VK_NULL_HANDLE;
+            }
+        }
+    };
+    // Each slot's image made with `usage`, its D3D12 memory imported and bound.
+    const auto importSlots = [&](VkImageUsageFlags slotUsage) -> bool {
+        for (std::uint32_t i = 0; i < kRingSize; ++i) {
+            RingSlot& slot = ring[i];
+            VkExternalMemoryImageCreateInfo externalCreate{
+                VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+            externalCreate.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+            VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &externalCreate};
+            imageInfo.imageType = VK_IMAGE_TYPE_2D;
+            imageInfo.format = ringFormat;
+            imageInfo.extent = {ringExtent.width, ringExtent.height, 1};
+            imageInfo.mipLevels = 1;
+            imageInfo.arrayLayers = 1;
+            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = slotUsage;
+            slot.copySource = (slotUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            r = dev.vk.CreateImage(dev.device, &imageInfo, nullptr, &slot.image);
+            if (r != VK_SUCCESS) {
+                CIRCLE_VR_LOG("presenter: vkCreateImage for ring slot %u failed: %d", i, r);
+                releaseSlots();
+                return false;
+            }
+            VkMemoryRequirements req{};
+            dev.vk.GetImageMemoryRequirements(dev.device, slot.image, &req);
+            VkMemoryWin32HandlePropertiesKHR handleProps{
+                VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR};
+            r = dev.vk.GetMemoryWin32HandlePropertiesKHR(
+                dev.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, imageHandles[i], &handleProps);
+            if (r != VK_SUCCESS) {
+                CIRCLE_VR_LOG("presenter: vkGetMemoryWin32HandlePropertiesKHR failed: %d", r);
+                releaseSlots();
+                return false;
+            }
+            const std::uint32_t bits = req.memoryTypeBits & handleProps.memoryTypeBits;
+            std::uint32_t typeIndex = UINT32_MAX;
+            for (std::uint32_t t = 0; t < memProps.memoryTypeCount; ++t) {
+                if (!(bits & (1u << t))) {
+                    continue;
+                }
+                if (typeIndex == UINT32_MAX ||
+                    (memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    typeIndex = t;
+                    if (memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                        break;
+                    }
+                }
+            }
+            if (typeIndex == UINT32_MAX) {
+                CIRCLE_VR_LOG("presenter: no memory type for the ring (image bits 0x%x, handle bits 0x%x)",
+                        req.memoryTypeBits, handleProps.memoryTypeBits);
+                releaseSlots();
+                return false;
+            }
+            VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+            dedicated.image = slot.image;
+            VkImportMemoryWin32HandleInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+                                                    &dedicated};
+            import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+            import.handle = imageHandles[i];
+            VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import};
+            allocInfo.allocationSize = req.size;
+            allocInfo.memoryTypeIndex = typeIndex;
+            r = dev.vk.AllocateMemory(dev.device, &allocInfo, nullptr, &slot.memory);
+            if (r != VK_SUCCESS) {
+                CIRCLE_VR_LOG("presenter: importing ring slot %u failed: %d", i, r);
+                releaseSlots();
+                return false;
+            }
+            r = dev.vk.BindImageMemory(dev.device, slot.image, slot.memory, 0);
+            if (r != VK_SUCCESS) {
+                CIRCLE_VR_LOG("presenter: binding ring slot %u failed: %d", i, r);
+                releaseSlots();
+                return false;
+            }
+        }
+
+        return true;
+    };
+    bool imported = importSlots(usage);
+    if (!imported && (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        // The format query allowed a copy source, but making or importing a slot with it failed: again
+        // without it, as when the query refuses it.
+        usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        CIRCLE_VR_LOG(
+            "presenter: the ring did not import as a copy source too; again without it (no capture of both "
+            "eyes)");
+        imported = importSlots(usage);
+    }
+    if (!imported) {
+        return false;
+    }
+
+    if (!fenceHandle) {
+        CIRCLE_VR_LOG("presenter: ring of %u re-imported (%ux%u format %d)", kRingSize, ringExtent.width,
+                ringExtent.height, ringFormat);
+        return true; // the timeline from the first import stays
+    }
+    // The shared D3D12 fence becomes a timeline semaphore.
+    VkSemaphoreTypeCreateInfo typeInfo{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    typeInfo.initialValue = 0;
+    VkPhysicalDeviceExternalSemaphoreInfo semInfo{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+                                                  &typeInfo};
+    semInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+    VkExternalSemaphoreProperties semProps{VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
+    ivk.GetPhysicalDeviceExternalSemaphoreProperties(dev.physicalDevice, &semInfo, &semProps);
+    CIRCLE_VR_LOG("presenter: D3D12 fence import features 0x%x", semProps.externalSemaphoreFeatures);
+    if (!(semProps.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT)) {
+        return false;
+    }
+    VkSemaphoreCreateInfo createInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &typeInfo};
+    r = dev.vk.CreateSemaphore(dev.device, &createInfo, nullptr, &timeline);
+    if (r != VK_SUCCESS) {
+        CIRCLE_VR_LOG("presenter: timeline vkCreateSemaphore failed: %d", r);
+        return false;
+    }
+    VkImportSemaphoreWin32HandleInfoKHR importSem{VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR};
+    importSem.semaphore = timeline;
+    importSem.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+    importSem.handle = fenceHandle;
+    r = dev.vk.ImportSemaphoreWin32HandleKHR(dev.device, &importSem);
+    if (r != VK_SUCCESS) {
+        CIRCLE_VR_LOG("presenter: importing the shared fence failed: %d", r);
+        return false;
+    }
+    CIRCLE_VR_LOG("presenter: ring of %u imported (%ux%u format %d)", kRingSize, ringExtent.width,
+            ringExtent.height, ringFormat);
+    return true;
+}
+
+void XrPresenter::Impl::destroyVulkanObjects() {
+    retiredSemaphores.drain([this](VkSemaphore s) { dev.vk.DestroySemaphore(dev.device, s, nullptr); });
+    for (auto& [handle, sc] : swapchains) {
+        for (VkSemaphore s : sc.presentSemaphores) {
+            dev.vk.DestroySemaphore(dev.device, s, nullptr);
+        }
+    }
+    swapchains.clear();
+    for (auto& [family, fc] : commands) {
+        dev.vk.DestroyCommandPool(dev.device, fc.pool, nullptr);
+    }
+    commands.clear();
+    for (RingSlot& slot : ring) {
+        if (slot.image) {
+            dev.vk.DestroyImage(dev.device, slot.image, nullptr);
+            slot.image = VK_NULL_HANDLE;
+        }
+        if (slot.memory) {
+            dev.vk.FreeMemory(dev.device, slot.memory, nullptr);
+            slot.memory = VK_NULL_HANDLE;
+        }
+    }
+    if (timeline) {
+        dev.vk.DestroySemaphore(dev.device, timeline, nullptr);
+        timeline = VK_NULL_HANDLE;
+    }
+    capture.destroy(dev);
+    mirror.destroy(dev);
+    destroyUiImages();
+}
+
+bool XrPresenter::Impl::createRing() {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = ringExtent.width;
+    desc.Height = ringExtent.height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format =
+        ringFormat == VK_FORMAT_R8G8B8A8_UNORM ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    std::array<HANDLE, kRingSize> handles{};
+    HANDLE fenceHandle = nullptr;
+    auto closeHandles = [&] {
+        for (HANDLE& h : handles) {
+            if (h) {
+                CloseHandle(h);
+                h = nullptr;
+            }
+        }
+        if (fenceHandle) {
+            CloseHandle(fenceHandle);
+            fenceHandle = nullptr;
+        }
+    };
+    for (std::uint32_t i = 0; i < kRingSize; ++i) {
+        HRESULT hr = d3dDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
+                                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                        IID_PPV_ARGS(&ring[i].resource));
+        if (SUCCEEDED(hr)) {
+            hr = d3dDevice->CreateSharedHandle(ring[i].resource.Get(), nullptr, GENERIC_ALL, nullptr,
+                                               &handles[i]);
+        }
+        if (FAILED(hr)) {
+            CIRCLE_VR_LOG("d3d12: shared ring image %u failed: 0x%08lx", i, hr);
+            closeHandles();
+            return false;
+        }
+    }
+    if (!sharedFence) {
+        HRESULT hr = d3dDevice->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&sharedFence));
+        if (SUCCEEDED(hr)) {
+            hr =
+                d3dDevice->CreateSharedHandle(sharedFence.Get(), nullptr, GENERIC_ALL, nullptr, &fenceHandle);
+        }
+        if (FAILED(hr)) {
+            CIRCLE_VR_LOG("d3d12: shared fence failed: 0x%08lx", hr);
+            closeHandles();
+            return false;
+        }
+    }
+    // Importing an NT handle does not transfer ownership, so ours are closed afterwards either way.
+    const bool ok = !stop.load() && importRing(handles, fenceHandle);
+    closeHandles();
+    if (ok) {
+        createUiImages(); // UI layer (without it the ring alone serves)
+        initializeFramegen();
+    }
+    return ok;
+}
+
+void XrPresenter::Impl::recreateRing() {
+    VkExtent2D extent{};
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint64_t lastWrite = 0;
+    {
+        std::lock_guard lock(mutex);
+        ringReady.store(false); // presents pass through from here on
+        resizeRequested.store(false);
+        extent = requestedExtent;
+        format = requestedFormat;
+        lastWrite = timelineValue;
+    }
+    // Every copy into the old ring, and every D3D12 copy out of it, must finish before it goes.
+    if (!waitFence(sharedFence.Get(), lastWrite, copyEvent, 2000) ||
+        !waitFence(copyFence.Get(), copyFenceValue, copyEvent, 2000) || !retireGpuCopy()) {
+        // Asked again, so the next present retries the rebuild instead of the headset keeping one image
+        // until the game recreates its swapchain.
+        resizeRequested.store(true);
+        CIRCLE_VR_LOG("presenter: copies into the old ring did not finish within 2 s; the headset keeps the last "
+                "image and the rebuild is tried again");
+        return;
+    }
+    {
+        std::lock_guard lock(mutex);
+        if (stop.load()) {
+            return; // shutdown has begun (and freed the ring); the game's device may be gone
+        }
+        for (RingSlot& slot : ring) {
+            if (slot.image) {
+                dev.vk.DestroyImage(dev.device, slot.image, nullptr);
+                slot.image = VK_NULL_HANDLE;
+            }
+            if (slot.memory) {
+                dev.vk.FreeMemory(dev.device, slot.memory, nullptr);
+                slot.memory = VK_NULL_HANDLE;
+            }
+            slot.resource.Reset();
+            slot.state.store(kSlotFree);
+            slot.hasView = false;
+        }
+        destroyUiImages();
+        // A Route S pair half-written into the old ring is gone with it.
+        if (pairing.pending()) {
+            pairing.leftNotStored();
+        }
+        if (alt.pairing.holding()) {
+            alt.pairing.carryNotStored(); // alternate eyes: the held image went with the old ring
+        }
+        pendingSlot = kRingSize;
+        capture.cancel();
+        gameExtent = extent;
+        gameFormat = format;
+        setRingExtent(extent);
+    }
+    // The new XR swapchains (the game image's, then the UI's) are made before the old ones go: after a
+    // destroy a runtime may hand a new swapchain one still in use (the OpenXR Simulator does:
+    // swapchain_book.hpp), which is then neither used nor destroyed. The reticle's and the menu beam's do not
+    // depend on the size and stay.
+    XrSwapchain oldSwapchain = xrSwapchain;
+    xrSwapchain = XR_NULL_HANDLE;
+    xrImages.clear();
+    XrSwapchain oldUi = detachUiSwapchain();
+    acquiredIndex = -1;
+    acquiredWaited = false;
+    heldCopy.stalled = false;
+    hasImage = false;
+    shownHasView = false;
+    lastConsumed = latest.load() >> 2; // the old ring's contents are gone
+    for (RingSlot& slot : ring) {
+        slot.published.store(0);
+    }
+    bool made = createXrSwapchain();
+    if (!made) {
+        // Once more after the old ones are gone: a runtime that handed back one in use may hand out a new one
+        // then (the simulator numbers them by how many it holds), and one short of memory for both sizes at
+        // once has theirs back.
+        xrSwapchains.destroy(xr, oldUi);
+        xrSwapchains.destroy(xr, oldSwapchain);
+        made = createXrSwapchain();
+    }
+    made = made && createRing();
+    if (made && uiReady && !createUiSwapchain()) {
+        uiFailed = true; // UI layer off until the next rebuild, as when acquireUiXrImage makes it
+    }
+    xrSwapchains.destroy(xr, oldUi);
+    xrSwapchains.destroy(xr, oldSwapchain); // valid with an image still acquired
+    // The reticle and the menu beam stay over a rebuild; one that failed is made again when next needed, as
+    // when the rebuild destroyed them.
+    if (reticleFailed) {
+        xrSwapchains.destroy(xr, reticleSwapchain);
+        reticleFailed = false;
+    }
+    if (menuPointerKept.beamFailed) {
+        destroyMenuXrObjects();
+    }
+    if (!made) {
+        status::flat("the images for the headset could not be recreated after a size change");
+        CIRCLE_VR_LOG("presenter: rebuilding the ring for %ux%u failed; the game runs flat", extent.width,
+                extent.height);
+        return;
+    }
+    std::lock_guard lock(mutex);
+    ringReady.store(true);
+    CIRCLE_VR_LOG("presenter: ring rebuilt for %ux%u format %d (D3D12 device 0x%08lx)", ringExtent.width,
+            ringExtent.height, ringFormat, static_cast<unsigned long>(d3dDevice->GetDeviceRemovedReason()));
+    requestRebuildIfStale();
+}
+
+// The slot of the newest image published before `below` that finished rendering (`completed`), is newer than
+// the last one shown (`shown`) and was not written again since, packed as `latest`; 0: none.
+static std::uint64_t newestFinished(const std::array<RingSlot, kRingSize>& ring,
+                                    std::uint64_t shown,
+                                    std::uint64_t below,
+                                    std::uint64_t completed) {
+    std::uint64_t best = 0;
+    for (std::uint32_t i = 0; i < kRingSize; ++i) {
+        const std::uint64_t value = ring[i].published.load();
+        if (value > shown && value <= completed && value < below && value > (best >> 2) &&
+            ring[i].value.load() == value) {
+            best = (value << 2) | i;
+        }
+    }
+    return best;
+}
+
+std::uint32_t XrPresenter::Impl::acquireFreeSlot(const FamilyCommands& fc, std::uint64_t completed) {
+    // With two eyes per slot, never the newest published slot: the worker may not have taken it yet, and a
+    // left half written into it would mix with the pair it holds. Never the newest finished one the worker
+    // has not shown either: it falls back to that one while the newest is still rendering.
+    const auto newest = static_cast<std::uint32_t>(latest.load() & 3u);
+    const bool skipNewest = ringEyes == 2 && (latest.load() >> 2) != 0;
+    const std::uint64_t finished = newestFinished(ring, lastConsumed.load(), latest.load() >> 2, completed);
+    for (std::uint32_t n = 0; n < kRingSize; ++n) {
+        const std::uint32_t candidate = (nextSlot + n) % kRingSize;
+        if ((skipNewest && candidate == newest) || (finished != 0 && candidate == (finished & 3u))) {
+            continue;
+        }
+        RingSlot& slot = ring[candidate];
+        const bool ordered=circle::fg::preserveRealPairs();
+        int expected = kSlotFree;
+        if (!slot.state.compare_exchange_strong(expected, kSlotWriting)) {
+            continue;
+        }
+        if (circle::fg::protectPublished(slot.published.load(),lastConsumed.load(),ordered) || completed < slot.value.load() || completed < fc.lastValue[candidate * 2] ||
+            completed < fc.lastValue[candidate * 2 + 1]) {
+            slot.state.store(kSlotFree);
+            continue;
+        }
+        slot.eyes = {}; // Parallel Eye Rendering's eye copy sets them; other copies show none
+        slot.fgInputs={};slot.fgEpoch=0;
+        nextSlot = (candidate + 1) % kRingSize;
+        return candidate;
+    }
+    return kRingSize;
+}
+
+void XrPresenter::Impl::publishSlot(std::uint32_t slotIndex, std::uint64_t value) {
+    RingSlot& slot = ring[slotIndex];
+    const auto stamp=circle::fg::pairPublished(value);
+    slot.publishedMs=stamp.timeMs;slot.producerWaitTotalMs=stamp.waitTotalMs;
+    slot.value.store(value);
+    slot.published.store(value);
+    slot.state.store(kSlotFree);
+    frameLogEyes.lastPresent.store(FrameRepeat::NoPresent); // until a present hands over none
+    latest.store((value << 2) | slotIndex);
+    ++framesCopied;
+    frame_pacing::onHandOver(); // the present hook waits for the headset's next frame under KHARVOX_CIRCLE_PACE
+}
+
+// The worker's slot for this frame, marked as being read (the choice: features/pacing/slot_choice.hpp). A
+// slot is published at present time, before the game's GPU work for it is done, so the newest is waited for
+// on the shared fence while the headset's frame (begun at `frameStart`, when xrWaitFrame returned) has time;
+// then the newest finished one not shown yet (newestFinished).
+bool XrPresenter::Impl::takeRenderedSlot(std::uint32_t& slotIndex,
+                                         std::uint64_t& value,
+                                         LONGLONG frameStart, bool queueGpuWait) {
+    const auto take = [&](std::uint64_t packed) {
+        const auto index = static_cast<std::uint32_t>(packed & 3u);
+        int expected = kSlotFree;
+        if (!ring[index].state.compare_exchange_strong(expected, kSlotReading)) {
+            return false; // being written right now
+        }
+        if (ring[index].value.load() != packed >> 2) {
+            ring[index].state.store(kSlotFree); // written again since it was published
+            return false;
+        }
+        slotIndex = index;
+        value = packed >> 2;
+        return true;
+    };
+    double waitSeconds = pacing::newestWaitSeconds(static_cast<double>(displayPeriod.load()) / 1e9,
+                                                   qpcSeconds(qpcNow() - frameStart));
+    // Auto needs adjacent real inputs, not the freshest available replacement.
+    // Acquire protects every unconsumed publication while this path is active.
+    if(circle::fg::preserveRealPairs()){
+        std::array<circle::fg::PublishedPair,kRingSize> publications{};
+        for(std::uint32_t i=0;i<kRingSize;++i)publications[i]={ring[i].published.load(),ring[i].value.load()};
+        const auto oldest=circle::fg::oldestUnconsumed(publications,lastConsumed.load());
+        if(!oldest)return false;
+        // Prefetch records commands immediately. Its submission waits on the
+        // Vulkan timeline on the GPU before reading any color/depth/motion.
+        if(!queueGpuWait&&sharedFence->GetCompletedValue()<(oldest>>2)){
+            if(waitSeconds<=0)return false;
+            const auto started=qpcNow();
+            const bool rendered=waitFenceFor(sharedFence.Get(),oldest>>2,copyEvent,waitSeconds);
+            newestWait.add(qpcSeconds(qpcNow()-started)*1000.);
+            if(!rendered)return false;
+        }
+        return take(oldest);
+    }
+    int lostRaces = 0;
+    for (;;) {
+        const std::uint64_t completed = sharedFence->GetCompletedValue();
+        const std::uint64_t newest = latest.load();
+        const std::uint64_t before = newestFinished(ring, lastConsumed.load(), newest >> 2, completed);
+        pacing::SlotOffer offer;
+        offer.newestUnshown = (newest >> 2) > lastConsumed.load();
+        offer.newestRendered = (newest >> 2) <= completed;
+        offer.previousReady = before != 0;
+        switch (pacing::chooseSlot(offer, waitSeconds)) {
+        case pacing::SlotChoice::TakeNewest:
+            if (take(newest)) {
+                ++xrNewestTaken;
+                return true;
+            }
+            return offer.previousReady && take(before);
+        case pacing::SlotChoice::WaitNewest: {
+            ++xrNewestWaits;
+            const LONGLONG waitStart = qpcNow();
+            const bool rendered = waitFenceFor(sharedFence.Get(), newest >> 2, copyEvent, waitSeconds);
+            newestWait.add(qpcSeconds(qpcNow() - waitStart) * 1000.0);
+            if (rendered && take(newest)) { // even if the game published again meanwhile
+                ++xrNewestTaken;
+                return true;
+            }
+            waitSeconds = 0.0; // one wait per frame
+            continue;
+        }
+        case pacing::SlotChoice::TakePrevious:
+            if (take(before)) {
+                return true;
+            }
+            waitSeconds = 0.0; // the game wrote it meanwhile: choose again (a newer one finished, or repeat)
+            if (++lostRaces > 2) {
+                return false;
+            }
+            continue;
+        case pacing::SlotChoice::Repeat:
+            return false;
+        }
+        return false;
+    }
+}
+
+void XrPresenter::Impl::setRingExtent(VkExtent2D game) {
+    // Each eye's image is the game's (T-031: the render size still follows the window); a Route S ring
+    // holds two of them side by side.
+    const std::uint32_t eyes = ringEyes == 2 ? 2 : 1;
+    eyeExtent.width = std::min(game.width, maxSwapchainWidth / eyes);
+    eyeExtent.height = std::min(game.height, maxSwapchainHeight);
+    ringExtent = {eyeExtent.width * eyes, eyeExtent.height};
+}
+
+void XrPresenter::Impl::requestRebuildIfStale() {
+    ringBuilt = true;
+    if (requestedExtent.width == gameExtent.width && requestedExtent.height == gameExtent.height &&
+        requestedFormat == gameFormat) {
+        return;
+    }
+    if (!resizeRequested.exchange(true)) {
+        CIRCLE_VR_LOG("presenter: the game's swapchain is now %ux%u format %d; the ring will be rebuilt",
+                requestedExtent.width, requestedExtent.height, requestedFormat);
+    }
+}
+
+} // namespace circlevr::vkcore

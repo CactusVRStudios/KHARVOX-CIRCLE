@@ -1,0 +1,20 @@
+circle_vr_add_module(circle_vr_xr_math
+    SOURCES
+        aim_check.cpp
+        enclosing_fov.cpp
+        eye_clip_transform.cpp
+        camera_anim.cpp
+        cinema_quad.cpp
+        cutscene_cuts.cpp
+        display_lead.cpp
+        fov.cpp
+        hand_aim.cpp
+        head_aim.cpp
+        head_view.cpp
+        offhand_pose.cpp
+        weapon_pose.cpp
+        projection.cpp
+        stereo_view.cpp
+        upright_space.cpp
+    DEPENDS
+        circle_vr_common)

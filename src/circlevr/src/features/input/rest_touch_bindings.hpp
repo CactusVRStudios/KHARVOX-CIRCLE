@@ -1,0 +1,119 @@
+#pragma once
+
+// The touch bindings the thumb-rest weapon wheel reads (rest_wheel.hpp), and a thumb rest bound like a button
+// (touch_button.hpp), which reads its rest the same way.
+//
+// A player's controller file replaces the built-in data of its profile whole (player_controller_data.hpp),
+// so a file copied before the wheel existed has no thumb-rest binding. The layer adds the ones a family's
+// data lacks before suggesting them; no file is rewritten. A runtime that refuses a profile for one of these
+// paths refuses all of its bindings, so the layer then suggests the profile again (touchRetries,
+// input_profiles.cpp): first without the sensors that only tell the thumb is elsewhere (withoutVetoTouch),
+// keeping the rests and the touches a map binds like buttons; then without those touches too
+// (withoutTouchButtons), keeping the rests; then without any of them.
+//
+// - The thumb rest: /input/thumbrest/touch on each hand whose profile lists it (only Touch controllers have
+//   the sensor; Touch Pro and Touch Plus report as Touch).
+// - Face-button touch (KHARVOX_CIRCLE_THUMBREST_FACE_TOUCH, off by default): the touch leaf of each hand's primary
+//   and secondary buttons (A/B, X/Y), for controllers without a thumb rest (Index, Pico 4). Not on the Steam
+//   Frame, whose bumper already holds the wheel, and not as the rest on Touch, which has the real sensor.
+// - The thumb elsewhere (DECISIONS T-120): on a hand with a thumb rest, the same face-button touch leaves;
+//   on any hand with a rest, the stick's touch (/input/thumbstick/touch); beside face touch, the trackpad's
+//   (/input/trackpad/touch, Index); where the profile lists them. A touch of the rest begun with the thumb on
+//   these waits, and one lost after the thumb went to them lifts at once (rest_wheel.hpp). They are not rests
+//   themselves (handHasRest).
+// Nothing is added on the Steam Frame, nor with the wheel off unless one of the family's control maps binds
+// a thumb rest (restTouchOptions): the built-in maps bind none.
+//
+// A touch on a control bound like a button (touch_inputs.hpp, DECISIONS T-126) gets its own binding the same
+// way (addBoundTouchBindings), on any family whose profile has the sensor, the Steam Frame too, and only
+// when one of the family's maps binds it: the built-in maps bind none, so nothing is added for them. The
+// first retry of a refused profile keeps such a binding (it is not only the thumb elsewhere); the second
+// drops it and keeps the rests, so a touch the runtime will not bind costs the wheel nothing.
+
+#include "features/input/binding_profile.hpp"
+#include "features/input/controller_bindings.hpp"
+#include "features/input/controller_state.hpp"
+#include "features/input/xr_action_set.hpp"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace circlevr::input {
+
+struct RestTouchOptions {
+    bool thumbRest = true; // the wheel is on, or a control map binds a thumb rest
+    bool faceTouch = false;
+};
+
+// Whether one of `data`'s control maps binds a thumb rest to an action, in any press kind.
+[[nodiscard]] bool bindsThumbRest(const ControllerData& data);
+
+// Whether one of `data`'s control maps binds `touch` of `hand` to an action, in any press kind.
+[[nodiscard]] bool bindsTouch(const ControllerData& data, Hand hand, ButtonInput touch);
+
+// The options for a family's data: its rests' bindings with the wheel on (`wheelOn`), or with a thumb rest
+// bound in one of its maps; face-button touch as the rest (`faceTouch`) only with the wheel on.
+RestTouchOptions restTouchOptions(const ControllerData& data, bool wheelOn, bool faceTouch);
+
+// True for the actions this file adds.
+bool isRestTouchAction(XrActionId action);
+
+// Adds the rest-touch bindings `data` lacks (in the data's own order, by hand and action); a path another
+// binding of the hand already uses is left alone. Returns how many were added.
+std::size_t addRestTouchBindings(ControllerData& data, RestTouchOptions options);
+
+// Adds the binding of each touch on a control (isControlTouch) a map of `data` binds and the data lacks,
+// where the profile has the sensor and no other binding of the hand uses its path. Returns how many.
+std::size_t addBoundTouchBindings(ControllerData& data);
+
+// `data` without any rest-touch binding: the profile suggested again when the runtime refused it.
+ControllerData withoutRestTouch(ControllerData data);
+
+[[nodiscard]] bool hasRestTouchBindings(const ControllerData& data);
+
+// `data` without the bindings that only tell the thumb is elsewhere (the stick's and the trackpad's touch,
+// and the face buttons' touch beside a thumb rest), the rests and the touches a map binds like buttons kept:
+// the first retry of a refused profile.
+ControllerData withoutVetoTouch(ControllerData data);
+
+[[nodiscard]] bool hasVetoTouchBindings(const ControllerData& data);
+
+// `data` without the veto sensors' bindings and those of the touches on controls a map binds like buttons,
+// the rests kept: the second retry of a refused profile.
+ControllerData withoutTouchButtons(ControllerData data);
+
+// Whether `data` suggests a touch on a control that one of its maps binds like a button.
+[[nodiscard]] bool hasTouchButtonBindings(const ControllerData& data);
+
+// The retries of a refused profile, in order (rest_touch_bindings.hpp above).
+enum class TouchRetry : std::uint8_t {
+    WithoutVeto,         // without the sensors that only tell the thumb is elsewhere
+    WithoutTouchButtons, // ... and without the touches bound like buttons: the rests kept
+    WithoutRestTouch,    // without any of the bindings this file adds
+};
+
+struct TouchRetryStep {
+    TouchRetry retry = TouchRetry::WithoutVeto;
+    ControllerData data; // what is suggested
+};
+
+// The retries for `data`, in order, each only where it leaves out more than the one before (none when `data`
+// has none of these bindings).
+std::vector<TouchRetryStep> touchRetries(const ControllerData& data);
+
+// Whether `hand` has a sensor the wheel reads as its thumb rest: the thumb rest, or with face touch one of
+// its face buttons' touch.
+bool handHasRest(const ControllerData& data, Hand hand, bool faceTouch);
+
+// Whether a face button's touch can be the wheel's rest on `data`'s family: Face buttons as thumb rest on
+// (`faceTouch`), and not the Steam Frame, whose bumper holds the wheel (a face touch a map binds there gets
+// its binding, but it is only a touch bound as a button).
+[[nodiscard]] bool faceTouchRests(const ControllerData& data, bool faceTouch);
+
+// The hands, by Hand, with a sensor the wheel reads as a rest on `data`'s family: handHasRest with
+// faceTouchRests.
+[[nodiscard]] std::array<bool, 2> wheelRestHands(const ControllerData& data, bool faceTouch);
+
+} // namespace circlevr::input

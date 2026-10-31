@@ -1,0 +1,38 @@
+# Synchronized sequential stereo (Route S, docs/VR_STEREO.md): the logic that needs no engine, Vulkan or
+# OpenXR (eye tags, present pairing, per-eye previous matrices, capture images, settings), so it is
+# tested on every platform.
+circle_vr_add_module(circle_vr_stereo_seq
+    SOURCES
+        adaptive_eyes.cpp
+        alternate_eyes.cpp
+        alternate_prev.cpp
+        bin_tiles.cpp
+        centered_matrix.cpp
+        debug_cvars.cpp
+        deflate.cpp
+        desktop_window.cpp
+        dlss_menu.cpp
+        drain_backoff.cpp
+        eye_pairing.cpp
+        eye_tags.cpp
+        eye_view_plan.cpp
+        fx_sync.cpp
+        geomcache_prev.cpp
+        keep_prev.cpp
+        moved_flag.cpp
+        ngx_eye.cpp
+        ngx_twin_retry.cpp
+        object_prev.cpp
+        pass_frames.cpp
+        png_writer.cpp
+        present_watch.cpp
+        prev_matrices.cpp
+        refraction_history.cpp
+        render_idle.cpp
+        scatter_history.cpp
+        seq_settings.cpp
+        setting_follow.cpp
+        ssdo_history.cpp
+        stack_budget.cpp
+        stereo_taa.cpp
+        world_gui.cpp)

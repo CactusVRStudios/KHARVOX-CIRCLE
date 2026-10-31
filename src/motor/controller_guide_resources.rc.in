@@ -1,0 +1,3 @@
+#include <windows.h>
+301 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/circle-controller-interaction-en.png"
+302 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/circle-controller-combat-en.png"

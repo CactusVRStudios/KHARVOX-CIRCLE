@@ -1,0 +1,242 @@
+#include "vkcore/keep_prev_hooks.hpp"
+
+#include "stereo_seq/alternate_prev.hpp"
+#include "stereo_seq/keep_prev.hpp"
+#include "vkcore/game_code.hpp"
+#include "vkcore/log.hpp"
+#include "vkcore/mid_hook.hpp"
+#include "vkcore/mp_guard.hpp"
+#include "vkcore/seq_alternate.hpp"
+#include "vkcore/seq_hooks.hpp"
+#include "vkcore/taa_hooks.hpp"
+
+#include <windows.h>
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+
+namespace circlevr::vkcore {
+
+namespace {
+
+constexpr const char* kTag = "seq-prev";
+
+// 0x1C8AE60: `movups xmm0, [rsi]` (the current matrix), `mov r9, rsi`, `add rcx, [rdx + 0x108]`, `movups
+// [rdi + r14], xmm0` (the previous one); rbx is the entity's index, rdi its index * 64, r14 the previous
+// matrices.
+constexpr const char* kCopySignature = "0F 10 06 4C 8B CE 48 03 8A 08 01 00 00 42 0F 11 04 37";
+// 0x1C8AEA7: `call` (the new current matrix), `test byte [r13 + 0x10], 1`, `jne`, then the second copy.
+constexpr const char* kAfterCallSignature = "E8 ?? ?? ?? ?? 41 F6 45 10 01 75 26 0F 10 06 42 0F 11 04 37";
+constexpr std::size_t kAfterCallHook = 5;
+constexpr std::ptrdiff_t kCallFromCopy = 0x47; // 0x1C8AEA7 - 0x1C8AE60
+constexpr std::size_t kMatrixBytes = 64;
+// Entities with a larger index keep the engine's behaviour.
+constexpr std::size_t kMaxEntities = std::size_t{1} << 20;
+
+std::once_flag g_once;
+bool g_installed = false;
+stereo_seq::KeepPrevMode g_mode = stereo_seq::KeepPrevMode::On;
+stereo_seq::PairClock g_clock;
+std::unique_ptr<std::atomic<std::uint32_t>[]> g_leftStamps;
+
+// Alternate eyes (on or auto): every commit leaves the entity's current matrix of two renders back as its
+// previous one (stereo_seq/alternate_prev.hpp), instead of eye R keeping eye L's. Per entity: the render of
+// its latest commit and the current matrix that commit replaced. Entities with a larger index keep the
+// engine's behaviour.
+constexpr std::size_t kMaxHeld = std::size_t{1} << 16;
+struct Held {
+    stereo_seq::PrevHold hold;
+    std::byte matrix[kMatrixBytes];
+};
+bool g_alternateRule = false;
+std::unique_ptr<Held[]> g_held;
+
+// The previous matrix saved between the two hooks, on the thread running the commit.
+struct Saved {
+    std::byte* at = nullptr;
+    std::byte matrix[kMatrixBytes];
+};
+thread_local Saved t_saved;
+
+// Rows: eye L (and mono), eye R.
+struct Counters {
+    std::atomic<std::uint64_t> copies[2]{}; // the commit's previous = current copies
+    std::atomic<std::uint64_t> sameTick{0}; // eye R copies of entities eye L committed in the same tick
+    std::atomic<std::uint64_t> kept{0};     // previous matrices put back
+    // Alternate eyes: commits by PrevAction (the engine's copy, the matrix of two renders back, a second
+    // commit in one render keeping the first one's), and commits past kMaxHeld.
+    std::atomic<std::uint64_t> actions[3]{};
+    std::atomic<std::uint64_t> unheld{0};
+    std::atomic<std::uint64_t> lastReport{0};
+} g_counters;
+
+stereo_seq::KeepPrevMode requestedMode() {
+    std::wstring value;
+    std::string narrow;
+    if (readEnv(L"KHARVOX_CIRCLE_STEREO_KEEP_PREV", value)) {
+        for (const wchar_t c : value) {
+            narrow.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+        }
+    }
+    return stereo_seq::keepPrevMode(narrow);
+}
+
+void report() {
+    const std::uint64_t now = GetTickCount64();
+    std::uint64_t last = g_counters.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10000 || !g_counters.lastReport.compare_exchange_strong(last, now)) {
+        return;
+    }
+    if (g_alternateRule) {
+        CIRCLE_VR_LOG(
+            "%s: alternate eyes: %llu commit(s) given the matrix of two renders back (committed in the "
+            "render before), %llu left as the engine's (not committed since), %llu second commit(s) in one "
+            "render keeping the first one's, %llu past the table; previous matrices put back %llu",
+            kTag, static_cast<unsigned long long>(g_counters.actions[1].exchange(0)),
+            static_cast<unsigned long long>(g_counters.actions[0].exchange(0)),
+            static_cast<unsigned long long>(g_counters.actions[2].exchange(0)),
+            static_cast<unsigned long long>(g_counters.unheld.exchange(0)),
+            static_cast<unsigned long long>(g_counters.kept.exchange(0)));
+        return;
+    }
+    CIRCLE_VR_LOG(
+        "%s: previous-matrix copies L %llu R %llu; eye R copies of entities eye L committed this tick %llu, "
+        "previous kept %llu",
+        kTag, static_cast<unsigned long long>(g_counters.copies[0].exchange(0)),
+        static_cast<unsigned long long>(g_counters.copies[1].exchange(0)),
+        static_cast<unsigned long long>(g_counters.sameTick.exchange(0)),
+        static_cast<unsigned long long>(g_counters.kept.exchange(0)));
+}
+
+// Alternate eyes, before the first copy: rsi is the current matrix, r14 + rdi the previous one.
+void onCopyAlternate(const HookRegisters& r, std::size_t index) {
+    if (index >= kMaxHeld) {
+        ++g_counters.unheld;
+        return;
+    }
+    Held& held = g_held[index];
+    const std::uint64_t render = seq_alternate::renderIndex();
+    const stereo_seq::PrevPlan plan = stereo_seq::planPrevious(held.hold, render);
+    ++g_counters.actions[static_cast<int>(plan.action)];
+    auto* previous = reinterpret_cast<std::byte*>(r.r14 + r.rdi);
+    if (g_mode == stereo_seq::KeepPrevMode::On && plan.action != stereo_seq::PrevAction::Engine) {
+        std::memcpy(t_saved.matrix, plan.action == stereo_seq::PrevAction::Keep ? previous : held.matrix,
+                    kMatrixBytes);
+        t_saved.at = previous;
+    }
+    if (plan.hold) {
+        held.hold = stereo_seq::PrevHold{true, render};
+        std::memcpy(held.matrix, reinterpret_cast<const std::byte*>(r.rsi), kMatrixBytes);
+    }
+}
+
+// Before the first copy: stamp (eye L) or save (eye R); with alternate eyes, onCopyAlternate.
+void onCopy(const HookRegisters& r) {
+    t_saved.at = nullptr;
+    if (!mp_guard::allowsGameTouch()) {
+        return;
+    }
+    const std::size_t index = static_cast<std::uint32_t>(r.rbx);
+    if (g_alternateRule) {
+        report();
+        onCopyAlternate(r, index);
+        return;
+    }
+    const stereo_seq::Eye eye = seqChainEye();
+    const bool right = eye == stereo_seq::Eye::Right;
+    ++g_counters.copies[right ? 1 : 0];
+    report();
+    if (index >= kMaxEntities) {
+        return;
+    }
+    if (!right) {
+        g_leftStamps[index].store(g_clock.leftStamp(), std::memory_order_relaxed);
+        return;
+    }
+    const std::uint32_t pair = g_clock.rightPair(seqRightTick());
+    const std::uint32_t stamp = g_leftStamps[index].load(std::memory_order_relaxed);
+    if (stamp == pair && pair != 0) {
+        ++g_counters.sameTick;
+    }
+    if (!stereo_seq::keepPrevious(g_mode, eye, stamp, pair)) {
+        return;
+    }
+    auto* previous = reinterpret_cast<std::byte*>(r.r14 + r.rdi);
+    std::memcpy(t_saved.matrix, previous, kMatrixBytes);
+    t_saved.at = previous;
+}
+
+// After the new current matrix: put the saved previous back.
+void onAfterCall(const HookRegisters&) {
+    if (t_saved.at == nullptr) {
+        return;
+    }
+    std::memcpy(t_saved.at, t_saved.matrix, kMatrixBytes);
+    t_saved.at = nullptr;
+    ++g_counters.kept;
+}
+
+} // namespace
+
+bool installKeepPrevHooks() {
+    std::call_once(g_once, [] {
+        g_mode = requestedMode();
+        if (g_mode == stereo_seq::KeepPrevMode::Off) {
+            CIRCLE_VR_LOG(
+                "%s: off (KHARVOX_CIRCLE_STEREO_KEEP_PREV=0): eye R's recommits reset the previous model matrix",
+                kTag);
+            return;
+        }
+        if (!mp_guard::allowsGameTouch()) {
+            CIRCLE_VR_LOG("%s: the multiplayer guard is not armed; not installed", kTag);
+            return;
+        }
+        if (!taaRequested()) {
+            CIRCLE_VR_LOG("%s: not installed: no per-eye temporal history (anti-aliasing off)", kTag);
+            return;
+        }
+        GameImage image;
+        if (!locateGameImage(image, kTag)) {
+            return;
+        }
+        const std::byte* copy = findUnique(image, kTag, "commit's previous-matrix copy", kCopySignature);
+        const std::byte* call = findUnique(image, kTag, "commit's current-matrix call", kAfterCallSignature);
+        if (!copy || !call || call - copy != kCallFromCopy) {
+            CIRCLE_VR_LOG("%s: the commit's model-matrix step did not check out; not installed", kTag);
+            return;
+        }
+        g_leftStamps = std::make_unique<std::atomic<std::uint32_t>[]>(kMaxEntities);
+        if (seqAlternateEyes()) {
+            g_held = std::make_unique<Held[]>(kMaxHeld);
+            g_alternateRule = true; // before the hooks go in
+        }
+        std::string error;
+        if (!installMidHook(const_cast<std::byte*>(copy), &onCopy, error)) {
+            CIRCLE_VR_LOG("%s: copy hook failed: %s", kTag, error.c_str());
+            return;
+        }
+        if (!installMidHook(const_cast<std::byte*>(call + kAfterCallHook), &onAfterCall, error)) {
+            // The first hook only stamps and saves; with nothing to put back it changes nothing.
+            CIRCLE_VR_LOG("%s: after-call hook failed: %s; counting only", kTag, error.c_str());
+            g_mode = stereo_seq::KeepPrevMode::Count;
+            return;
+        }
+        g_installed = true;
+        CIRCLE_VR_LOG("%s: the commit's model-matrix step hooked (RVA 0x%X, 0x%X): %s", kTag, image.rva(copy),
+                image.rva(call + kAfterCallHook),
+                g_mode == stereo_seq::KeepPrevMode::Count ? "counting only (KHARVOX_CIRCLE_STEREO_KEEP_PREV=count)"
+                : g_alternateRule
+                    ? "alternate eyes: each commit leaves the current matrix of two renders back "
+                      "as the previous one (each eye's own last render)"
+                    : "eye R keeps eye L's previous model matrix for entities eye L committed "
+                      "this tick");
+    });
+    return g_installed;
+}
+
+} // namespace circlevr::vkcore

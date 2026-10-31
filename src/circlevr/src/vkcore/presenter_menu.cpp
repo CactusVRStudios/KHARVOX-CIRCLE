@@ -1,0 +1,570 @@
+#include "motor/laser_sight.hpp"
+#include "ui_layer/ui_settings.hpp"
+// Menus in VR (docs/VR_MENUS.md): while the game shows its menu cursor, the menu goes onto a world-locked
+// panel in front of the player (the UI quad for menus over the game, such as pause; the game's whole frame
+// for the title screen and the main menu), a laser from the pointing hand meets the panel, and the router
+// (features/menu/menu_router.hpp) drives the game's own cursor, clicks, back and scrolling through its raw
+// input. The controllers' gameplay actions are held back meanwhile.
+
+#include "vkcore/presenter_impl.hpp"
+#include "vkcore/presenter_menu_release.hpp"
+
+#include "features/menu/menu_kind.hpp"
+#include "game/eternal/usercmd_buttons.hpp"
+#include "vkcore/controllers.hpp"
+#include "vkcore/keep_active.hpp"
+#include "vkcore/key_inject.hpp"
+#include "vkcore/menu_cursor.hpp"
+#include "vkcore/menu_cursor_hide.hpp"
+#include "vkcore/menu_input.hpp"
+#include "vkcore/menu_model_hook.hpp"
+#include "vkcore/mp_guard.hpp"
+#include "xr_math/cinema_quad.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <string_view>
+#include <utility>
+
+namespace circlevr::vkcore {
+
+namespace {
+
+// Worker only: the chain of screens the menu up belongs to, whether the controllers asked for it and the map
+// loads since (menu_kind.hpp; one presenter per process; kept here, not in PresenterImpl, which is at the
+// file size limit). And the cursors nobody asked for in a play map taken for a screen, for the log.
+menu::MenuChain g_menuChain;
+int g_unaskedScreens = 0;
+constexpr int kUnaskedScreenLines = 10;
+
+// The pointer's drawing: the beam's thickness, its length when it misses the panel, the dot's angular size.
+constexpr float kBeamThicknessMetres = 0.005f;
+constexpr float kBeamMissMetres = 1.0f;
+constexpr float kDotDegrees = 0.9f;
+constexpr float kDotOffsetMetres = 0.004f; // in front of the panel
+constexpr std::uint32_t kBeamWidthPixels = 16;
+constexpr std::uint32_t kBeamHeightPixels = 128;
+constexpr std::uint32_t kDotPixels = 64; // the reticle image, reused
+constexpr double kPanelGraceSeconds = 0.5;
+constexpr double kMenuHoldSeconds = 1.0;
+// A menu over the game that comes up this long after the controllers asked for one (the pause key, the
+// Dossier) is taken for a popup the game raised by itself. The rig saw the pause menu's cursor 0.05 s after
+// the key and the Dossier's 0.03 s after its button.
+constexpr double kMenuRequestSeconds = 1.5;
+// The strip at the top of the menu's 16:9 band where tabbed screens (the Dossier, settings) have their tabs.
+constexpr float kTabStripV = 0.08f;
+// The room transform moved by more than this while a panel is up: a re-anchor (a recenter, the runtime's
+// or ours, or the height after standing up or sitting down); the panel is placed in front of the head again.
+constexpr float kReanchorMetres = 0.05f;
+constexpr float kReanchorDegrees = 3.0f;
+
+bool reanchored(const Pose& a, const Pose& b) {
+    const float dot = std::fabs(a.orientation.x * b.orientation.x + a.orientation.y * b.orientation.y +
+                                a.orientation.z * b.orientation.z + a.orientation.w * b.orientation.w);
+    const float degrees = 2.0f * std::acos(std::min(1.0f, dot)) * 57.29578f;
+    return length(a.position - b.position) > kReanchorMetres || degrees > kReanchorDegrees;
+}
+
+XrPosef toXr(const Pose& p) {
+    return {{p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w},
+            {p.position.x, p.position.y, p.position.z}};
+}
+
+// How the sticks moved the Dossier map last frame (map_drag.hpp), for the log: each change for the first
+// kMapGestureLines changes (worker only).
+struct MapGesture {
+    menu::MapPanBy pan = menu::MapPanBy::None;
+    bool rotate = false;
+    int logged = 0;
+};
+MapGesture g_mapGesture;
+constexpr int kMapGestureLines = 60;
+
+void logMapGesture(menu::MapPanBy pan, bool rotate) {
+    MapGesture& g = g_mapGesture;
+    if (pan == g.pan && rotate == g.rotate) {
+        return;
+    }
+    g.pan = pan;
+    g.rotate = rotate;
+    if (g.logged >= kMapGestureLines) {
+        return;
+    }
+    ++g.logged;
+    const char* panText = pan == menu::MapPanBy::Drag   ? "pans with the left button held"
+                          : pan == menu::MapPanBy::Keys ? "pans with W A S D"
+                                                        : "does not pan";
+    CIRCLE_VR_LOG("menu: map sticks: the pan stick %s, the other stick %s%s", panText,
+            rotate ? "rotates with the right button held" : "does not rotate",
+            g.logged == kMapGestureLines ? " (the last such line)" : "");
+}
+
+menu::RouterHand routerHand(const input::HandState& h) {
+    menu::RouterHand r;
+    r.trigger = h.trigger;
+    r.grip = h.grip;
+    r.stick = h.stick;
+    r.primary = h.primaryButton;
+    r.secondary = h.secondaryButton;
+    r.stickClick = h.stickClick;
+    return r;
+}
+
+} // namespace
+
+void XrPresenter::Impl::startMenu() {
+    if (!settings.ui.menuPointer) {
+        CIRCLE_VR_LOG("menu: pointer off (KHARVOX_CIRCLE_MENU_POINTER=0)");
+        return;
+    }
+    menuInstalled = menu_cursor::install();
+    if (menuInstalled) {
+        menu_cursor_hide::install();
+        menu_model::install(); // a menu's 3D model on the panel (menu_model_hook.hpp)
+    }
+    CIRCLE_VR_LOG("menu: pointer %s; panel %.2f m wide, %.2f m ahead, world-locked while a menu is up%s",
+            menuInstalled ? "on" : "OFF (reason above)", settings.ui.menuWidthMetres,
+            settings.ui.menuDistanceMetres, settings.ui.menuBeam ? "" : "; no beam");
+}
+
+std::optional<Pose> XrPresenter::Impl::locateHead(XrTime time) const {
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    constexpr XrSpaceLocationFlags needed =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    if (XR_FAILED(xr.xrLocateSpace(viewSpace, localSpace, time, &location)) ||
+        (location.locationFlags & needed) != needed) {
+        return std::nullopt;
+    }
+    Pose head;
+    head.orientation = {location.pose.orientation.x, location.pose.orientation.y, location.pose.orientation.z,
+                        location.pose.orientation.w};
+    head.position = {location.pose.position.x, location.pose.position.y, location.pose.position.z};
+    return head;
+}
+
+bool XrPresenter::Impl::placeMenuPanel(XrTime time) {
+    const std::optional<Pose> head = locateHead(time);
+    if (!head) {
+        return false;
+    }
+    menuPanel.pose = xr_math::cinemaQuadPose(*head, settings.ui.menuDistanceMetres);
+    menuPanel.pose.position.y += settings.ui.offsetYMetres;
+    menuPanelPlaced = true;
+    menuFollow.reset();
+    return true;
+}
+
+void releaseMenuInput(XrPresenter::Impl& p, const char* why) {
+    p.updateMotorMenu(0,nullptr);
+    if (!p.menuRouter || !p.menuRouter->holdsInput()) {
+        return;
+    }
+    const menu::RouterOutput out = p.menuRouter->releaseHeld(qpcSeconds(qpcNow()));
+    menu_input::send(out.events);
+    menu_cursor_hide::setHidden(false);
+    menu_input::setSuppressGameplay(false);
+    CIRCLE_VR_LOG("menu: %s: the menu's held input is let go (%zu release(s))", why, out.events.size());
+}
+
+void XrPresenter::Impl::updateMenu(XrTime time, bool panelContent) {
+    const std::optional<menu_cursor::CursorState> cursor =
+        menuInstalled ? menu_cursor::read() : std::optional<menu_cursor::CursorState>{};
+    const bool allowed = menuInstalled && mp_guard::allowsGameTouch();
+    // A frame or two without a panel (a GUI capture a little late) does not end menu mode: the panel
+    // keeps its place and the router its state for up to kPanelGraceSeconds.
+    const double now = qpcSeconds(qpcNow());
+    if (panelContent) {
+        menuPanelSeen = now;
+    }
+    const bool showing = panelContent || ((menuOn || menuHeld) && now - menuPanelSeen < kPanelGraceSeconds);
+    if (!menuRouter) {
+        menuRouter.emplace(controllers::dominantHand(), controllers::mapSticks());
+    }
+    // A cursor the game shows for the weapon wheel is not a menu: the stick selects and gameplay input stays
+    // on (wheel_cursor.hpp).
+    menu::WheelCursorInput wheelIn;
+    wheelIn.seconds = now;
+    wheelIn.cursorShown = allowed && cursor && cursor->active;
+    wheelIn.menuUp = menuOn || menuHeld;
+    wheelIn.wheelHeld = game::contains(controllers::heldActions(), game::GameAction::WeaponWheel);
+    const menu::WheelCursorOutput wheel = menuRouter->wheelCursor().update(wheelIn);
+    if (wheel.started) {
+        CIRCLE_VR_LOG("menu: the weapon wheel is up: the game shows its cursor at %d, %d; no panel or pointer, the "
+                "stick selects and gameplay input stays on",
+                cursor->x, cursor->y);
+    } else if (wheel.ended) {
+        CIRCLE_VR_LOG("menu: the weapon wheel's cursor is gone%s",
+                wheelIn.cursorShown ? "; the cursor stays: a menu" : "");
+    }
+    const bool cursorActive = wheelIn.cursorShown && !wheel.owned;
+    const bool active = cursorActive && showing;
+    const std::optional<input::InputFrame> frame = controllers::latestFrame();
+    // The cursor can go while its menu stays up (the pause menu logged "the cursor is gone" 0.12 s after it
+    // opened). While the backdrop test (backdrop_probe.hpp) still sees the menu's full-screen backdrop, the
+    // panel keeps its place for up to kMenuHoldSeconds; the pointer and the router's hold on gameplay end
+    // with the cursor. A cursor back within the hold finds the panel where it was.
+    if (!active && menuOn) {
+        menuCursorGone = now;
+    }
+    const bool wasHeld = menuHeld;
+    menuHeld = !active && (menuOn || menuHeld) && allowed && showing && uiBackdrop.backdrop() &&
+               now - menuCursorGone < kMenuHoldSeconds;
+    if (menuHeld && !wasHeld && !shownHasView) {
+        CIRCLE_VR_LOG("menu: the panel keeps the whole frame while the backdrop shows (no head-tracked frame)");
+    }
+    if (wasHeld && !menuHeld && !active) {
+        CIRCLE_VR_LOG("menu: the panel is down (held %.2f s)", now - menuCursorGone);
+    }
+
+    // A cursor nobody asked for in a play map came up this frame (for the log below).
+    bool unaskedInPlayMap = false;
+    if (active && !menuOn) {
+        // Tutorial and lore popups show the cursor over the game unasked; they wait for Space or E. The
+        // Dossier the controllers asked for opens on its map page (the router follows its tabs). A cursor
+        // back within moments of the last one going, or onto the held panel, is the same menu changing
+        // screens and keeps its kind, unless a map load came since that menu began (menu_kind.hpp).
+        menu::MenuKindInput kindIn;
+        kindIn.overGame = panelContent && shownHasView;
+        kindIn.playMap = mp_guard::inPlayMap();
+        kindIn.menuRequested = controllers::menuRequestedWithin(kMenuRequestSeconds);
+        kindIn.dossierRequested = controllers::dossierRequestedWithin(kMenuRequestSeconds);
+        kindIn.hadMenu = menuCursorGone > 0.0;
+        kindIn.previous = menuPopup     ? menu::MenuKind::Popup
+                          : menuDossier ? menu::MenuKind::Dossier
+                                        : menu::MenuKind::Screen;
+        kindIn.sinceCursorGone = now - menuCursorGone;
+        const menu::MenuChain::Step step = g_menuChain.onCursor(kindIn, wasHeld, mp_guard::mapLoads());
+        if (step.keepsPanel) {
+            CIRCLE_VR_LOG("menu: the cursor is back; the panel stays where it was");
+        } else {
+            if (step.continues) {
+                CIRCLE_VR_LOG("menu: the cursor is back after %.2f s: the same menu (%s) on another screen",
+                        kindIn.sinceCursorGone, menu::menuKindName(step.kind));
+            } else if (step.afterLoad) {
+                CIRCLE_VR_LOG("menu: a map load came since the last menu began: this cursor begins a new one");
+            }
+            menuPopup = step.kind == menu::MenuKind::Popup;
+            menuDossier = step.kind == menu::MenuKind::Dossier;
+            // A menu came up: its panel goes in front of the head (yaw only) at the UI quad's height.
+            placeMenuPanel(time);
+            menuReplace.store(false, std::memory_order_relaxed);
+            menuRoom.reset();
+            const ui_layer::PixelRect content = menuContent();
+            if (const auto size =
+                    ui_layer::panelSize(settings.ui.menuWidthMetres, content.width, content.height)) {
+                menuPanel.width = size->width;
+                menuPanel.height = size->height;
+            }
+            CIRCLE_VR_LOG("menu: the game shows its cursor (%s): panel %.2f x %.2f m at (%.2f, %.2f, %.2f)%s",
+                    menuPopup ? "a popup over the game, not asked for: A / X sends Space, a stick click E, Y "
+                                "Left Alt, the gameplay buttons their actions' keys"
+                    : menuDossier                  ? "the Dossier, on its map: the sticks move the map"
+                    : panelContent && shownHasView ? "a menu over the game"
+                                                   : "a menu screen",
+                    menuPanel.width, menuPanel.height, menuPanel.pose.position.x, menuPanel.pose.position.y,
+                    menuPanel.pose.position.z, frame ? "" : "; no controllers");
+            unaskedInPlayMap = kindIn.playMap && !kindIn.menuRequested && !kindIn.dossierRequested;
+            if (unaskedInPlayMap && !step.continues) {
+                // The desktop's keyboard reaches the game only while its window is in front (key_inject.hpp).
+                const ForegroundWindow front = foregroundWindow();
+                CIRCLE_VR_LOG("menu: nobody asked for this cursor (a play map%s); in front: %s%s",
+                        kindIn.overGame ? "" : ", no head-tracked frame behind it", front.who.c_str(),
+                        front.game ? "" : " (the desktop's keyboard and mouse do not reach the game)");
+            }
+        }
+    } else if (!active && menuOn) {
+        CIRCLE_VR_LOG("menu: the cursor is gone; %s",
+                menuHeld ? "the pointer is down, the panel stays while the menu's backdrop shows"
+                         : "the panel and the pointer are down");
+    }
+    menuOn = active && menuPanelPlaced && menuPanel.width > 0.0f;
+    const menu::MenuKind menuKind = menuDossier ? menu::MenuKind::Dossier
+                                    : menuPopup ? menu::MenuKind::Popup
+                                                : menu::MenuKind::Screen;
+    const bool overGame = panelContent && shownHasView;
+    if (menuOn && g_menuChain.becomesPopup(menuKind, overGame, mp_guard::inPlayMap(), mp_guard::mapLoads())) {
+        menuPopup = true;
+        CIRCLE_VR_LOG("menu: the screen %s and nobody asked for it: a popup (A / X sends Space, a stick click E, Y "
+                "Left Alt, the gameplay buttons their actions' keys)",
+                overGame ? "shows over the game now" : "is up in a play map");
+    } else if (menuOn && unaskedInPlayMap && !menuPopup && g_unaskedScreens < kUnaskedScreenLines) {
+        // It continues a menu the controllers asked for (the pause menu's Settings, a Dossier screen).
+        ++g_unaskedScreens;
+        CIRCLE_VR_LOG("menu: a cursor nobody asked for in a play map is taken for a screen of the menu asked for "
+                "before (A / X clicks, no Space)%s",
+                g_unaskedScreens == kUnaskedScreenLines ? " (the last such line)" : "");
+    }
+    menuHeld = menuHeld && menuPanelPlaced && menuPanel.width > 0.0f;
+    menuUp.store(cursorActive || menuOn || menuHeld, std::memory_order_relaxed);
+
+    menu::RouterInput in;
+    in.seconds = now;
+    in.menuActive = menuOn;
+    in.popup = menuOn && menuPopup;
+    in.dossier = menuOn && menuDossier;
+    in.actions = controllers::heldActions();
+    in.width = gameExtent.width;
+    in.height = gameExtent.height;
+    if (cursor) {
+        in.gameCursor = menu::CursorPixel{cursor->x, cursor->y};
+    }
+    // A re-anchor while the panel is up (the runtime moved LOCAL, or the room transform jumped: a recenter or
+    // the height after standing up or sitting down): the panel goes in front of the head again. The panel
+    // and the rays are both in LOCAL, so they agree either way; this keeps the panel where the player is.
+    // So does turning away from the panel for a while (KHARVOX_CIRCLE_MENU_FOLLOW, panel_follow.hpp).
+    if ((menuOn || menuHeld) && frame) {
+        const bool runtimeMoved = menuReplace.exchange(false, std::memory_order_relaxed);
+        bool turnedAway = false;
+        if (settings.ui.menuFollow) {
+            if (const std::optional<Pose> head = locateHead(time)) {
+                turnedAway = menuFollow.update(menu::horizontalAngleTo(*head, menuPanel.pose.position), now);
+            }
+        }
+        if (runtimeMoved || turnedAway || (menuRoom && reanchored(*menuRoom, frame->roomFromLocal))) {
+            if (placeMenuPanel(time)) {
+                CIRCLE_VR_LOG("menu: %s; the panel is placed again in front of the head at (%.2f, %.2f, %.2f)",
+                        runtimeMoved ? "the runtime moved LOCAL"
+                        : turnedAway ? "the head turned away from the panel"
+                                     : "the room was re-anchored",
+                        menuPanel.pose.position.x, menuPanel.pose.position.y, menuPanel.pose.position.z);
+            }
+        }
+        menuRoom = frame->roomFromLocal;
+    } else {
+        menuRoom.reset();
+    }
+
+    if (frame) {
+        // Left Menu held + a trigger is the in-headset capture (the mapper asks for it; under SteamVR with
+        // Touch controllers both sticks held too): no click meanwhile. The chord's buttons follow the runtime
+        // and the family in use, as the mapper's do.
+        if (const input::CaptureButtons buttons = controllers::captureButtons();
+            menuChord.buttons() != buttons) {
+            menuChord = input::CaptureChord(input::kTriggerThresholds, buttons);
+        }
+        // The time since the chord last ran, at most 0.1 s: a stall is not time the sticks were held.
+        const double last = std::exchange(menuPointerKept.chordSeconds, now);
+        const float chordDt = last > 0.0 ? static_cast<float>(std::clamp(now - last, 0.0, 0.1)) : 0.0f;
+        const input::CaptureChordOutput chord = menuChord.update(*frame, chordDt);
+        for (const input::Hand hand : {input::Hand::Left, input::Hand::Right}) {
+            const input::HandState& h = frame->hand(hand);
+            menu::RouterHand& r = in.hands[static_cast<std::size_t>(hand)];
+            r = routerHand(h);
+            if (chord.triggerHeldBack[static_cast<std::size_t>(hand)]) {
+                r.trigger = 0.0f;
+            }
+            if (menuOn && h.poseValid) {
+                // The hand is located in room space; the panel lives in LOCAL.
+                r.hit = menu::intersectPanel(menuPanel, menu::localFromRoom(frame->roomFromLocal, h.aimPose));
+                r.onTabStrip = r.hit && r.hit->v < kTabStripV;
+            }
+        }
+    }
+    // The panel shows the GUI's 16:9 band (menuContent): the router takes the hits on the whole image.
+    menu::RouterInput routed = in;
+    const ui_layer::PixelRect content = menuContent();
+    for (menu::RouterHand& r : routed.hands) {
+        if (r.hit) {
+            const ui_layer::ImageUv uv =
+                ui_layer::contentToImage(r.hit->u, r.hit->v, content, in.width, in.height);
+            r.hit->u = uv.u;
+            r.hit->v = uv.v;
+        }
+    }
+    const menu::RouterOutput out = menuRouter->update(routed);
+    // Vibration: a light tick on the pointing hand as its ray comes onto the panel (enter_tick.hpp: a frame
+    // without controller data is not a miss), and on a click.
+    for (const input::Hand hand : {input::Hand::Left, input::Hand::Right}) {
+        menu::EnterTick& enter = menuPointerKept.enterTicks[static_cast<std::size_t>(hand)];
+        if (!menuOn) {
+            // While the panel is only held (the cursor went a moment), the ray is off it: a cursor that
+            // flickers back does not tick again. A closed menu starts afresh.
+            if (menuHeld) {
+                enter.update(false, now);
+            } else {
+                enter.reset();
+            }
+            continue;
+        }
+        std::optional<bool> hit;
+        if (frame && frame->hand(hand).poseValid) {
+            hit = in.hands[static_cast<std::size_t>(hand)].hit.has_value();
+        }
+        if (enter.update(hit, now) && hand == out.pointerHand) {
+            controllers::noteMenuHaptic(hand, input::MenuTick::Enter);
+        }
+    }
+    for (const menu::RouterEvent& e : out.events) {
+        if (e.kind == menu::RouterEvent::Kind::ButtonDown) {
+            controllers::noteMenuHaptic(out.pointerHand, input::MenuTick::Click);
+        }
+    }
+    for (const menu::PopupActionKey& k : out.popupKeys) {
+        const std::string_view action = game::gameActionName(k.action);
+        const std::string_view key = game::keyName(k.key);
+        CIRCLE_VR_LOG("menu: popup: %.*s sends %.*s (0x%02x)", static_cast<int>(action.size()), action.data(),
+                static_cast<int>(key.size()), key.data(), k.key);
+    }
+    menu_input::send(out.events);
+    // A stick dragging the map moves the game's cursor about: hidden meanwhile (drag_cursor_hide.hpp).
+    menu_cursor_hide::setHidden(allowed && menuOn && out.hideCursor);
+    menu_input::setSuppressGameplay(out.suppressGameplay);
+    if (out.mapPage != menuMapPage) {
+        menuMapPage = out.mapPage;
+        CIRCLE_VR_LOG("menu: %s", menuMapPage ? "the Dossier's map page: the sticks pan, zoom and rotate the map"
+                                        : "not the Dossier's map page (or not known): the sticks scroll and "
+                                          "change tabs");
+    }
+
+    logMapGesture(out.mapPan, out.mapRotate);
+
+    // What the pointer looks like this frame.
+    menuPointer = {};
+    if (menuOn && out.pointerVisible && frame) {
+        const input::HandState& h = frame->hand(out.pointerHand);
+        const std::optional<menu::PanelHit>& hit = in.hands[static_cast<std::size_t>(out.pointerHand)].hit;
+        if (h.poseValid) {
+            const Pose aim = menu::localFromRoom(frame->roomFromLocal, h.aimPose);
+            menuPointer.visible = true;
+            menuPointer.from = aim.position;
+            // The beam turns to face the head (without a head pose: the panel's viewing position).
+            menuPointer.eye =
+                frame->head.poseValid
+                    ? menu::localFromRoom(frame->roomFromLocal, frame->head.pose).position
+                    : transformPoint(menuPanel.pose, Vec3{0.0f, 0.0f, settings.ui.menuDistanceMetres});
+            if (hit) {
+                menuPointer.hit = true;
+                menuPointer.to = hit->point;
+                menuPointer.dot = menu::dotPose(menuPanel, hit->u, hit->v, kDotOffsetMetres);
+                menuPointer.dotSide =
+                    ui_layer::reticleSideMetres(length(hit->point - menuPointer.eye), kDotDegrees);
+            } else {
+                menuPointer.to = aim.position + rotate(aim.orientation, Vec3{0.0f, 0.0f, -kBeamMissMetres});
+            }
+        }
+    }
+    if (menuOn) {
+        ++menuFrames;
+    }
+    logMenuStats();
+}
+
+ui_layer::PixelRect XrPresenter::Impl::menuContent() const {
+    const VkExtent2D image = gameExtent.width ? gameExtent : eyeExtent;
+    return settings.ui.wideCrop ? ui_layer::wideContentRect(image.width, image.height)
+                                : ui_layer::PixelRect{0, 0, image.width, image.height};
+}
+
+void XrPresenter::Impl::placeOnMenuPanel(XrCompositionLayerQuad& quad) const {
+    if (settings.ui.wideCrop) {
+        // The quad's image cut to its 16:9 band, as the panel's size is (a band already cut stays as it is).
+        XrRect2Di& rect = quad.subImage.imageRect;
+        const ui_layer::PixelRect band = ui_layer::wideContentRect(
+            static_cast<std::uint32_t>(rect.extent.width), static_cast<std::uint32_t>(rect.extent.height));
+        rect.offset.y += band.y;
+        rect.extent.height = static_cast<std::int32_t>(band.height);
+    }
+    quad.space = localSpace;
+    quad.pose = toXr(menuPanel.pose);
+    quad.size = {menuPanel.width, menuPanel.height};
+}
+
+std::uint32_t XrPresenter::Impl::fillPointerQuads(XrCompositionLayerQuad* first) {
+    if (!menuOn || !menuPointer.visible) {
+        return 0;
+    }
+    std::uint32_t count = 0;
+    if (settings.ui.menuBeam && !menuPointerKept.beamFailed) {
+        if (!menuPointerKept.beamSwapchain &&
+            !createStaticImage(menuPointerKept.beamSwapchain,
+                               menu::beamImage(kBeamWidthPixels, kBeamHeightPixels), kBeamWidthPixels,
+                               kBeamHeightPixels, "menu beam")) {
+            menuPointerKept.beamFailed = true;
+        }
+        const auto beam =
+            menu::beamQuad(menuPointer.from, menuPointer.to, menuPointer.eye, kBeamThicknessMetres);
+        if (!menuPointerKept.beamFailed && beam) {
+            XrCompositionLayerQuad& quad = first[count++];
+            quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            quad.space = localSpace;
+            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            quad.subImage.swapchain = menuPointerKept.beamSwapchain;
+            quad.subImage.imageRect = {
+                {0, 0},
+                {static_cast<std::int32_t>(kBeamWidthPixels), static_cast<std::int32_t>(kBeamHeightPixels)}};
+            quad.subImage.imageArrayIndex = 0;
+            quad.pose = toXr(beam->pose);
+            quad.size = {beam->width, beam->length};
+        }
+    }
+    if (menuPointer.hit && !reticleFailed) {
+        if (!reticleSwapchain && !createReticle()) {
+            reticleFailed = true;
+        } else {
+            XrCompositionLayerQuad& quad = first[count++];
+            quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            quad.space = localSpace;
+            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            quad.subImage.swapchain = reticleSwapchain;
+            quad.subImage.imageRect = {
+                {0, 0}, {static_cast<std::int32_t>(kDotPixels), static_cast<std::int32_t>(kDotPixels)}};
+            quad.subImage.imageArrayIndex = 0;
+            quad.pose = toXr(menuPointer.dot);
+            quad.size = {menuPointer.dotSide, menuPointer.dotSide};
+        }
+    }
+    return count;
+}
+
+std::uint32_t XrPresenter::Impl::fillLaserQuads(XrCompositionLayerQuad* first) {
+    if(!circle::motor::laser::enabled()||laserFailed)return 0;
+    // Prepare once on entering gameplay, before the player first readies a firearm.
+    const auto red=[](std::vector<std::uint8_t> pixels){for(size_t i=0;i+3<pixels.size();i+=4){pixels[i]=pixels[i+3];pixels[i+1]=std::uint8_t(pixels[i+3]*.094f);pixels[i+2]=std::uint8_t(pixels[i+3]*.047f);}return pixels;};
+    if(!laserBeamSwapchain&&!createStaticImage(laserBeamSwapchain,red(menu::beamImage(16,64)),16,64,"weapon laser")){laserFailed=true;return 0;}
+    if(!laserDotSwapchain&&!createStaticImage(laserDotSwapchain,red(ui_layer::reticleImage(64)),64,64,"laser dot")){laserFailed=true;return 0;}
+    const auto& ray=shownView.laser;const auto now=GetTickCount64();
+    if(menuOn||menuHeld||!shownHasView||shownView.cutscene||!ray.valid||now<ray.tick||now-ray.tick>=100||
+       !circle::motor::laser::visible(ray.owner,ray.weapon,ray.life)||laserFailed)return 0;
+    const Vec3 from{ray.from[0],ray.from[1],ray.from[2]},to{ray.to[0],ray.to[1],ray.to[2]};
+    const auto& lp=shownView.eyes[0].pose.position;const auto& rp=shownView.eyes[1].pose.position;
+    const Vec3 eye{(lp.x+rp.x)*.5f,(lp.y+rp.y)*.5f,(lp.z+rp.z)*.5f};
+    const auto beam=menu::beamQuad(from,to,eye,.004f);if(!beam)return 0;
+    auto& line=first[0];line={XR_TYPE_COMPOSITION_LAYER_QUAD};line.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    line.space=localSpace;line.eyeVisibility=XR_EYE_VISIBILITY_BOTH;line.subImage.swapchain=laserBeamSwapchain;
+    line.subImage.imageRect={{0,0},{16,64}};line.pose=toXr(beam->pose);line.size={beam->width,beam->length};
+    if(!ray.hit)return 1;
+    auto& dot=first[1];dot={XR_TYPE_COMPOSITION_LAYER_QUAD};dot.layerFlags=line.layerFlags;dot.space=localSpace;
+    dot.eyeVisibility=XR_EYE_VISIBILITY_BOTH;dot.subImage.swapchain=laserDotSwapchain;dot.subImage.imageRect={{0,0},{64,64}};
+    dot.pose.orientation=shownView.eyes[0].pose.orientation;dot.pose.position={to.x,to.y,to.z};
+    const float distance=std::sqrt((to.x-eye.x)*(to.x-eye.x)+(to.y-eye.y)*(to.y-eye.y)+(to.z-eye.z)*(to.z-eye.z));
+    const float side=std::clamp(distance*.0015f,.006f,.04f);dot.size={side,side};return 2;
+}
+
+void XrPresenter::Impl::logMenuStats() {
+    const ULONGLONG now = GetTickCount64();
+    if (!menuInstalled || now - lastMenuStatsTicks < 10000) {
+        return;
+    }
+    lastMenuStatsTicks = now;
+    const menu_input::Counters c = menu_input::counters();
+    const auto cursor = menu_cursor::read();
+    const DesktopCursorCounters desktop = desktopCursorCounters();
+    CIRCLE_VR_LOG("menu: %llu frame(s) with the panel up; %llu move(s), %llu click(s), %llu wheel(s), %llu key(s), "
+            "%llu not delivered; cursor %s at %d, %d; gameplay input %s; the game's desktop cursor moves "
+            "%llu and clips %llu kept off the desktop, %llu desktop input record(s) neutralised",
+            static_cast<unsigned long long>(menuFrames), static_cast<unsigned long long>(c.moves),
+            static_cast<unsigned long long>(c.clicks), static_cast<unsigned long long>(c.wheels),
+            static_cast<unsigned long long>(c.keys), static_cast<unsigned long long>(c.failed),
+            cursor ? (cursor->active ? "shown" : "hidden") : "unreadable", cursor ? cursor->x : 0,
+            cursor ? cursor->y : 0, menu_input::suppressGameplay() ? "held back" : "on",
+            static_cast<unsigned long long>(desktop.moves), static_cast<unsigned long long>(desktop.clips),
+            static_cast<unsigned long long>(desktop.input));
+}
+
+void XrPresenter::Impl::destroyMenuXrObjects() {
+    xrSwapchains.destroy(xr, menuPointerKept.beamSwapchain);
+    xrSwapchains.destroy(xr,laserBeamSwapchain);xrSwapchains.destroy(xr,laserDotSwapchain);laserFailed=false;
+    menuPointerKept.beamFailed = false;
+}
+
+} // namespace circlevr::vkcore

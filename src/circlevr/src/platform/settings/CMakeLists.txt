@@ -1,0 +1,11 @@
+circle_vr_add_module(circle_vr_settings
+    SOURCES
+        builtin.cpp
+        preset.cpp
+        profile.cpp
+        profile_name.cpp
+        profile_store.cpp
+        schema.cpp
+        setting_value.cpp
+    DEPENDS
+        circle_vr_common)

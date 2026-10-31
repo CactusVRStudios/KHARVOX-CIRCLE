@@ -1,0 +1,11 @@
+{
+  "version": 5,
+  "configurePresets": [{
+    "name": "windows-x64",
+    "generator": "Visual Studio 17 2022",
+    "architecture": "x64",
+    "binaryDir": "${sourceDir}/build/x64",
+    "cacheVariables": { "CIRCLE_VR_BUILD_TESTS": "OFF", "CIRCLE_VR_BUILD_LAYER": "ON" }
+  }],
+  "buildPresets": [{ "name": "windows-x64", "configurePreset": "windows-x64", "configuration": "RelWithDebInfo", "jobs": 8 }]
+}

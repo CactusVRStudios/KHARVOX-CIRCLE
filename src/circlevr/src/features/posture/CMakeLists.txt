@@ -1,0 +1,10 @@
+circle_vr_add_module(circle_vr_posture
+    SOURCES
+        anchor_detector.cpp
+        eye_height.cpp
+        floor_check.cpp
+        posture_detector.cpp
+        posture_tracker.cpp
+        seated_walk.cpp
+    DEPENDS
+        circle_vr_common)
