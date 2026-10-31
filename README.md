@@ -7,7 +7,6 @@ Stereoscopic rendering, tracked motion controllers, physical melee, and a dedica
 
 > **Hardware requirement: at least 12 GB of VRAM.** Indiana Jones and the Great Circle is a very demanding game, especially in VR. Higher headset resolutions and graphics settings can require considerably more GPU performance and memory. Upscaling and frame generation do not remove this requirement.
 
-[![Support Cactus VR Studios on Ko-fi](assets/ko-fi-support.png)](https://ko-fi.com/cactusvrstudios/tip)
 
 [Installation](#installation) · [Controller bindings](#controller-bindings) · [Building from source](#building-from-source) · [Support](#support)
 
@@ -119,3 +118,5 @@ Close the game before running the complete suite: launcher handoff tests use a s
 ## Support
 
 If you enjoy CIRCLE and would like to support development, visit [Cactus VR Studios on Ko-fi](https://ko-fi.com/cactusvrstudios/tip).
+
+[![Support Cactus VR Studios on Ko-fi](assets/ko-fi-support.png)](https://ko-fi.com/cactusvrstudios/tip)
