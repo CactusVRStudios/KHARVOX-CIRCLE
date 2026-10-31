@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(KharvoxCircle VERSION 0.0.1 LANGUAGES CXX C)
+project(KharvoxCircle VERSION 0.1.0 LANGUAGES CXX C)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "KHARVOX CIRCLE requires Windows x64")
 endif()

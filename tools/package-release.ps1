@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9-]+$')][string]$Name,[string]$SettingsFile)
+param([Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$')][string]$Name,[string]$SettingsFile)
 $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSScriptRoot
 $destination=Join-Path $root ('releases/'+$Name)

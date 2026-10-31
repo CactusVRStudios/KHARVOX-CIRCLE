@@ -174,7 +174,7 @@ sealed class Launcher : Window {
     public Launcher(string directory, bool isPreview, GpuInfo detectedGpu=null) {
         root=directory; preview=isPreview;gpu=detectedGpu??GpuInfo.Detect();
         settingsPath=preview?Path.Combine(root,"circle-settings.json"):SettingsStore.Resolve(root,SettingsStore.SharedPath);
-        Title="KHARVOX: CIRCLE Launcher — Alpha R017"; Width=916; Height=682; MinWidth=840; MinHeight=640;
+        Title="KHARVOX: CIRCLE Launcher — Beta 0.1"; Width=916; Height=682; MinWidth=840; MinHeight=640;
         Background=Brushes.Black; Foreground=Brushes.White; FontFamily=new FontFamily("Segoe UI"); FontSize=14;
         WindowStartupLocation=WindowStartupLocation.CenterScreen;
         var readPath=File.Exists(SettingsPath)?SettingsPath:Path.Combine(root,"circle-settings.defaults.json");
@@ -582,7 +582,7 @@ sealed class Launcher : Window {
         if(Convert.ToString(defaults["vr_fg_multiplier"])!="auto-fixed"||
            Convert.ToBoolean(defaults["vr_performance_overlay"])||Convert.ToBoolean(defaults["vr_hands_only"])||
            !Convert.ToBoolean(defaults["vr_laser_sight"])||Convert.ToDouble(defaults["vr_smooth_turn_speed"])!=240||
-           Convert.ToDouble(defaults["vr_snap_angle"])!=60)throw new Exception("R017 embedded first-start defaults mismatch.");
+           Convert.ToDouble(defaults["vr_snap_angle"])!=60)throw new Exception("Beta 0.1 embedded first-start defaults mismatch.");
         foreach(ulong size in new ulong[]{0,8UL<<30,10UL<<30})
             if(!new GpuInfo{DedicatedVramBytes=size}.LowVram)throw new Exception("Low VRAM warning missing.");
         foreach(ulong size in new ulong[]{(10UL<<30)+1,12UL<<30,16UL<<30,24UL<<30})
@@ -590,7 +590,7 @@ sealed class Launcher : Window {
         if(new GpuInfo().LowVram)throw new Exception("Unknown VRAM must not trigger a low-memory warning.");
         if(!Equals(options.Single(o=>o.Key=="vr_fg_multiplier").Default,"auto-fixed")||
            !Equals(options.Single(o=>o.Key=="vr_snap_angle").Default,60)||
-           !Equals(options.Single(o=>o.Key=="vr_smooth_turn_speed").Default,240))throw new Exception("R017 fallback defaults mismatch.");
+           !Equals(options.Single(o=>o.Key=="vr_smooth_turn_speed").Default,240))throw new Exception("Beta 0.1 fallback defaults mismatch.");
         // Headless WPF template/selection check: never show or control a window.
         var perf=options.Single(o=>o.Key=="vr_performance_overlay");
         if(!Equals(perf.Default,false))throw new Exception("Performance overlay must default off.");

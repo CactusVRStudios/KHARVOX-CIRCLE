@@ -36,9 +36,9 @@ The VR intro runs before the game. After its first start, **Disable VR Intro** b
 
 Rendering options include upscaling and VR frame generation, with available backends depending on your GPU. Choose fixed frame-generation multipliers, **Auto** for conservative whole-number switching, or **Auto Seamless** for adaptive interpolation. Apply rendering changes before starting the game.
 
-## Alpha status
+## Beta status
 
-CIRCLE is in active alpha development. Compatibility, performance, and some interactions can vary by headset, GPU, runtime, and game version. SteamVR and Virtual Desktop's VDXR have been tested; this does not guarantee every device configuration.
+CIRCLE is in active beta development. Compatibility, performance, and some interactions can vary by headset, GPU, runtime, and game version. SteamVR and Virtual Desktop's VDXR have been tested; this does not guarantee every device configuration.
 
 Report problems through [Issues](https://github.com/CactusVRStudios/KHARVOX-CIRCLE/issues), including the mod version, headset, GPU, runtime, and steps to reproduce. Enable logging in the launcher when collecting diagnostic logs; it is off by default.
 
@@ -99,7 +99,7 @@ Keep all required runtime files together. The launcher EXE alone is not a comple
 After building, choose an unused release name:
 
 ```powershell
-.\tools\package-release.ps1 -Name KHARVOX-CIRCLE-Alpha-R999
+.\tools\package-release.ps1 -Name KHARVOX-CIRCLE-Beta-0.1-local
 ```
 
 The script builds the launcher, verifies the frame-generation payloads, and creates a runtime-only folder and ZIP under `releases/`. It refuses to overwrite an existing release. Developer documentation, tests, logs, and debug symbols are not included in the package.
