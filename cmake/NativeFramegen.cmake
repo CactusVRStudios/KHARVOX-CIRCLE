@@ -1,7 +1,13 @@
 # NVIDIA DLSS SDK 310.9.1. Runtime DLLs are supplied by the selected game installation.
 set(CIRCLE_DLSS_SDK_ROOT "${CMAKE_SOURCE_DIR}/references/dlss-sdk" CACHE PATH "Pinned NVIDIA DLSS SDK checkout")
 if(NOT EXISTS "${CIRCLE_DLSS_SDK_ROOT}/include/nvsdk_ngx_helpers_dlssg_d3d.h")
-  message(FATAL_ERROR "DLSS SDK missing. See docs/native-vr-framegen.md for the pinned SDK setup.")
+  include(FetchContent)
+  FetchContent_Declare(circle_dlss_sdk
+    GIT_REPOSITORY https://github.com/NVIDIA/DLSS.git
+    GIT_TAG 374959484e79a640feaba44c93ac8cfb0a03f5b5
+    GIT_PROGRESS TRUE)
+  FetchContent_MakeAvailable(circle_dlss_sdk)
+  set(CIRCLE_DLSS_SDK_ROOT "${circle_dlss_sdk_SOURCE_DIR}")
 endif()
 add_library(circle_ngx_sdk INTERFACE)
 target_include_directories(circle_ngx_sdk INTERFACE "${CIRCLE_DLSS_SDK_ROOT}/include")

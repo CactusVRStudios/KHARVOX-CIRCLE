@@ -126,3 +126,37 @@ fixtures/
 /Start-Launcher.cmd
 /Start-VR.cmd
 /Launch-Circle.ps1
+
+# Build inputs explicitly distributed with the source checkout.
+!/tests/
+!/tests/**/
+!/tests/**/*.cpp
+!/src/**/*_test.cpp
+!/tools/test-*.ps1
+!/bin/
+/bin/*
+!/bin/KHARVOX CIRCLE Intro.exe
+!/third_party/
+/third_party/*
+!/third_party/fidelityfx/
+/third_party/fidelityfx/*
+!/third_party/fidelityfx/ffx_api/
+!/third_party/fidelityfx/bin/
+/third_party/fidelityfx/bin/*
+!/third_party/fidelityfx/bin/CircleFidelityFX_DX12.dll
+!/runtimes/
+/runtimes/*
+!/runtimes/dlss-unlocked-0.4.0/
+/runtimes/dlss-unlocked-0.4.0/*
+!/runtimes/dlss-unlocked-0.4.0/rtx20-30/
+!/runtimes/dlss-unlocked-0.4.0/rtx40/
+/runtimes/dlss-unlocked-0.4.0/*/*
+!/runtimes/dlss-unlocked-0.4.0/*/dlssg_sm86.ini
+!/runtimes/dlss-unlocked-0.4.0/*/version.dll
+!/runtimes/dlss-unlocked-0.4.0/*/dlssg_sm86/
+!/runtimes/dlss-unlocked-0.4.0/*/dlssg_sm86/**/*.dll
+
+!/src/**/test_*.cpp
+!/src/**/test_*.hpp
+!/tests/**/*.hpp
+!/tests/**/*.h

@@ -18,13 +18,6 @@ $embedded=[ordered]@{
 }
 foreach($entry in $embedded.GetEnumerator()){$resources+=('/resource:'+(Join-Path $root $entry.Key)+',Circle.'+$entry.Value)}
 $resources+=('/resource:'+([IO.Path]::GetFullPath($SettingsFile))+',Circle.defaults.json')
-$noticeFiles=@('LICENSE','licenses/renderer-components-MIT.txt','licenses/renderer-components-NOTICES.md','licenses/ARGENT-MIT.txt','third_party/fidelityfx/LICENSE.txt','licenses/frame-generation-MIT.txt','third_party/NVIDIA-DLSS-SDK-LICENSE.txt','licenses/VRIntro-OpenXR-Apache-2.0.txt','licenses/VRIntro-jsoncpp-LICENSE.txt','licenses/community-framegen-notices.txt')
-$notices=($noticeFiles | ForEach-Object {"`r`n===== $_ =====`r`n"+[IO.File]::ReadAllText((Join-Path $root $_))}) -join "`r`n"
-$resourceDir=Join-Path $root 'build/launcher-resources'
-[IO.Directory]::CreateDirectory($resourceDir) | Out-Null
-$noticePath=Join-Path $resourceDir 'notices.txt'
-[IO.File]::WriteAllText($noticePath,$notices,(New-Object Text.UTF8Encoding($false)))
-$resources+=('/resource:'+$noticePath+',Circle.notices.txt')
 $framework=Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319'
 $wpf=Join-Path $framework 'WPF'
 $compiler=Join-Path $framework 'csc.exe'

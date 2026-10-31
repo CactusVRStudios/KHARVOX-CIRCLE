@@ -5,7 +5,7 @@ $destination=Join-Path $root ('releases/'+$Name)
 $zip=$destination+'.zip'
 if((Test-Path -LiteralPath $destination) -or (Test-Path -LiteralPath $zip)){throw 'Release already exists; choose a new name.'}
 if((Get-FileHash -LiteralPath (Join-Path $root 'bin/CircleFidelityFX_DX12.dll') -Algorithm SHA256).Hash -ne '12A5081257EC95B0B53AD51B4A87FB3C03F97FE0BBB59F9496968F8D50EF93A6'){throw 'FidelityFX runtime hash mismatch.'}
-# Compile all UI assets, defaults, build catalog, launch policies and attribution
+# Compile all UI assets, defaults, build catalog and launch policies
 # into the launcher. No resource or script extraction is required at runtime.
 & (Join-Path $PSScriptRoot 'build-launcher.ps1') -SettingsFile $SettingsFile
 & (Join-Path $PSScriptRoot 'install-community-framegen.ps1') -VerifyOnly -EnableLogging $false

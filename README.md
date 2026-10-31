@@ -46,7 +46,7 @@ Report problems through [Issues](https://github.com/CactusVRStudios/KHARVOX-CIRC
 
 The Windows build produces the Vulkan/OpenXR renderer, frame-generation components, and the CIRCLE launcher.
 
-**Source checkout status:** this repository is a filtered source snapshot, not yet a self-contained build distribution. Tests, third-party payloads, and documentation/license resources are intentionally excluded. The current CMake configuration still references test sources, and launcher compilation embeds notice resources from the full development workspace. Restore these required inputs from a complete development checkout before using the commands below. Setting `CIRCLE_VR_BUILD_TESTS=OFF` alone does not disable the top-level CIRCLE test targets. For playing the mod, use a packaged release.
+The checkout includes the CMake test sources, launcher assets, prebuilt VR intro, and pinned frame-generation runtime DLLs. CMake downloads the remaining SDK dependencies automatically on the first configure. No private development folders are required.
 
 ### Requirements
 
@@ -55,7 +55,6 @@ The Windows build produces the Vulkan/OpenXR renderer, frame-generation componen
 - CMake 3.24 or newer, Git, and PowerShell. Run the commands in a Visual Studio Developer PowerShell.
 - The Windows .NET Framework 4.x compiler and WPF assemblies used by `tools/build-launcher.ps1`.
 - Internet access for the dependencies downloaded and checksum-verified by CMake.
-- The complete project assets and the locally supplied dependencies listed below.
 
 ### Libraries and runtime dependencies
 
@@ -64,10 +63,10 @@ The Windows build produces the Vulkan/OpenXR renderer, frame-generation componen
 | OpenXR loader and headers 1.1.63 | Headset/runtime integration | Downloaded and verified by CMake. |
 | Vulkan headers | Vulkan layer integration | Uses an installed Vulkan SDK, or downloads pinned Vulkan-Headers 1.4.357. |
 | SafetyHook 0.7.0 with Zydis | Native game hooks | Downloaded and verified by CMake. |
-| NVIDIA DLSS SDK 310.9.1 | DLSS frame-generation integration | Set `CIRCLE_DLSS_SDK_ROOT` to a complete SDK checkout. Requires `include/nvsdk_ngx_helpers_dlssg_d3d.h` and the static x64 NGX libraries under `lib/Windows_x86_64/x64/`. |
-| FidelityFX SDK 1.1.4 integration | AMD frame-generation backend | Restore the project's headers and matching `third_party/fidelityfx/bin/CircleFidelityFX_DX12.dll`. CMake verifies the expected binary hash; an arbitrary SDK DLL is not a substitute. |
-| Community DLSS runtime 0.4.0 | Additional frame-generation backends | Restore the pinned RTX 20/30 and RTX 40 payloads under `runtimes/dlss-unlocked-0.4.0/`; packaging verifies them. |
-| CIRCLE VR Intro | Intro before game launch | Supply the built `bin/KHARVOX CIRCLE Intro.exe`. The intro is built in its separate project. |
+| NVIDIA DLSS SDK 310.9.1 | DLSS frame-generation integration | Fetched automatically from [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS/tree/374959484e79a640feaba44c93ac8cfb0a03f5b5) at the pinned commit. An existing SDK can optionally be supplied with `CIRCLE_DLSS_SDK_ROOT`. |
+| FidelityFX SDK 1.1.4 integration | AMD frame-generation backend | Includes the project's headers and matching `third_party/fidelityfx/bin/CircleFidelityFX_DX12.dll`. CMake verifies the expected binary hash; an arbitrary SDK DLL is not a substitute. |
+| Community DLSS runtime 0.4.0 | Additional frame-generation backends | Includes pinned RTX 20/30 and RTX 40 payloads under `runtimes/dlss-unlocked-0.4.0/`; packaging verifies them. |
+| CIRCLE VR Intro | Intro before game launch | Included as `bin/KHARVOX CIRCLE Intro.exe`; no separate intro build is needed. |
 
 Dependency versions and checksums are defined in `src/circlevr/cmake/`, `cmake/NativeFramegen.cmake`, `CMakeLists.txt`, and `tools/install-community-framegen.ps1`.
 
@@ -80,10 +79,10 @@ git clone https://github.com/CactusVRStudios/KHARVOX-CIRCLE.git
 cd KHARVOX-CIRCLE
 ```
 
-After restoring the development inputs described above, configure the build. Replace the SDK path with your installation:
+Configure and build:
 
 ```powershell
-cmake --preset windows-x64 -DCIRCLE_DLSS_SDK_ROOT="C:/Dependencies/DLSS"
+cmake --preset windows-x64
 cmake --build --preset windows-x64
 ```
 
@@ -97,7 +96,7 @@ Keep all required runtime files together. The launcher EXE alone is not a comple
 
 ### Create a playable package
 
-With the native build, launcher resources, intro, and runtime payloads available, choose an unused release name:
+After building, choose an unused release name:
 
 ```powershell
 .\tools\package-release.ps1 -Name KHARVOX-CIRCLE-Alpha-R999
@@ -107,7 +106,7 @@ The script builds the launcher, verifies the frame-generation payloads, and crea
 
 ### Development checks
 
-The test sources and test scripts are kept in the full local development workspace. With those restored, run:
+The CMake test sources and PowerShell checks are included. Run:
 
 ```powershell
 ctest --test-dir build/x64 -C RelWithDebInfo --output-on-failure
