@@ -99,7 +99,7 @@ Keep all required runtime files together. The launcher EXE alone is not a comple
 After building, choose an unused release name:
 
 ```powershell
-.\tools\package-release.ps1 -Name KHARVOX-CIRCLE-Beta-0.1-local
+.\tools\package-release.ps1 -Name KHARVOX-CIRCLE-Beta-0.2-local
 ```
 
 The script builds the launcher, verifies the frame-generation payloads, and creates a runtime-only folder and ZIP under `releases/`. It refuses to overwrite an existing release. Developer documentation, tests, logs, and debug symbols are not included in the package.

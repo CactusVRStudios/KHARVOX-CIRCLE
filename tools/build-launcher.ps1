@@ -28,6 +28,6 @@ $references+=@('PresentationCore.dll','PresentationFramework.dll','WindowsBase.d
  if(!(Test-Path -LiteralPath $path)){$path=Join-Path $framework $_}
  '/reference:'+$path
 }
-& $compiler /nologo /target:winexe /platform:x64 /optimize+ ('/out:'+(Join-Path $root 'CircleLauncher.exe')) @references @resources (Join-Path $root 'src/launcher/CircleLauncher.cs') (Join-Path $root 'src/launcher/EmbeddedResources.cs')
+& $compiler /nologo /codepage:65001 /target:winexe /platform:x64 /optimize+ ('/out:'+(Join-Path $root 'CircleLauncher.exe')) @references @resources (Join-Path $root 'src/launcher/CircleLauncher.cs') (Join-Path $root 'src/launcher/EmbeddedResources.cs')
 if($LASTEXITCODE -ne 0){throw 'Circle launcher compilation failed.'}
 Write-Output (Join-Path $root 'CircleLauncher.exe')

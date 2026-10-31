@@ -174,7 +174,7 @@ sealed class Launcher : Window {
     public Launcher(string directory, bool isPreview, GpuInfo detectedGpu=null) {
         root=directory; preview=isPreview;gpu=detectedGpu??GpuInfo.Detect();
         settingsPath=preview?Path.Combine(root,"circle-settings.json"):SettingsStore.Resolve(root,SettingsStore.SharedPath);
-        Title="KHARVOX: CIRCLE Launcher — Beta 0.1"; Width=916; Height=682; MinWidth=840; MinHeight=640;
+        Title="KHARVOX: CIRCLE Launcher \u2014 Beta 0.2"; Width=916; Height=682; MinWidth=840; MinHeight=640;
         Background=Brushes.Black; Foreground=Brushes.White; FontFamily=new FontFamily("Segoe UI"); FontSize=14;
         WindowStartupLocation=WindowStartupLocation.CenterScreen;
         var readPath=File.Exists(SettingsPath)?SettingsPath:Path.Combine(root,"circle-settings.defaults.json");
@@ -246,7 +246,7 @@ sealed class Launcher : Window {
         Note(4,"The game folder is detected on every launcher start, with Steam preferred when both versions are installed. You can change the folder manually. OpenXR runtime selection is automatic. Settings save automatically and apply on the next launch; correct invalid entries before closing. Click Launch in VR to play the CIRCLE intro first. Press a controller button to continue to Indiana Jones. Disable VR Intro becomes available under Rendering after the first intro start; this preference is saved across releases.");
         Note(4,"RENDERING",true);
         Note(4,"Anti-aliasing / Upscaling: Off, TAA, DLSS SR, or DLSS SR + VR Frame Generation. DLSS SR uses the quality setting selected in-game. DLSS VR Frame Generation requires supported NVIDIA hardware and DLSS SR. AMD FSR and AMD FSR + VR FG are experimental alternatives using the native game FSR quality setting. AMD VR FG uses FidelityFX with adaptive pacing; it generates an intermediate image for each eye. Selecting it disables Mono VR. Missing inputs or runtime errors fall back to real images.");
-        Note(4,"RenderScale changes resolution per eye (0.5â€“2.0); lower values reduce GPU load and detail. Stereoscopic Cinema Screen enables 3D cutscenes; off uses a flat 16:9 screen. Item inspection, Journal and Travels remain 2D. Mono VR renders one shared image for both eyes, retaining tracking but removing stereo depth; cinema is also 2D. Enabling Mono VR disables integrated FG and keeps the selected upscaler.");
+        Note(4,"RenderScale changes resolution per eye (0.5-2.0); lower values reduce GPU load and detail. Stereoscopic Cinema Screen enables 3D cutscenes; off uses a flat 16:9 screen. Item inspection, Journal and Travels remain 2D. Mono VR renders one shared image for both eyes, retaining tracking but removing stereo depth; cinema is also 2D. Enabling Mono VR disables integrated FG and keeps the selected upscaler.");
         Note(4,"Only Submit Real Frames is always enabled: old images are not repeatedly submitted. Integrated FG can still submit its newly generated images. Native desktop FG is blocked in stereo; it is separate from integrated VR FG. Shift-click Made by Cactus to reveal Development: the live performance overlay, diagnostics, Open Logs and Runtime Check. Enable Logging under Rendering defaults off and applies on the next game start. Use the overlay to distinguish requested FG from active generation and fallback.");
         Note(4,"FRAME GENERATION MODES",true);
         Note(4,"Auto Seamless prioritizes fresh rendered images and fills the remaining gap to the headset refresh rate, up to 4x. Auto uses fixed 2x/3x/4x steps with sustained-load checks and controlled downshift trials. Fixed multipliers keep the selected factor. Available modes depend on GPU support; AMD FG is limited to 2x. The performance overlay distinguishes real and generated stereo pairs.");
@@ -255,8 +255,8 @@ sealed class Launcher : Window {
         Note(4,"Tap left Y to open/close the map/inventory. Hold Y for the item-selection layer: right stick selects, X confirms while Y remains held. In menus, use the right-hand ray and right trigger to click. Native menu confirmation/back uses right A/B. Hands Only under VR Options hides the gameplay body while retaining hands and held items.");
         Note(4,"PICKUP, THROWING AND COMBAT",true);
         Note(4,"Look at a usable object and squeeze either grip with that trigger released to interact; X remains the button fallback. Keep grip held to carry. Release at a valid placement prompt to place; otherwise release to drop. For an item picked up with X, first grip it to take ownership.");
-        Note(4,"To throw a throwable object: hold grip, touch the same handâ€™s Quest thumb rest or Index trackpad, keep that trigger released, swing and release grip. Throw direction follows your gaze. Holding the trigger selects striking instead of touch-assisted throwing; grip release alone does not create a strike.");
-        Note(4,"Fists and melee items: hold the corresponding grip and swing to strike. Hold grip + that handâ€™s trigger to charge, then swing while still holding both. Trigger release alone cancels the charge. Left/right fists work independently. Separate swings can repeat without releasing the buttons; let the hand slow between strokes. Both grips maintain guard when native combat allows it and restore it after attacks/hits. With empty hands, fully squeeze both grips into combat readiness and click the RIGHT stick to push an eligible nearby enemy. With a held item, right stick click still holsters. Release the click before pushing again.");
+        Note(4,"To throw a throwable object: hold grip, touch the same hand's Quest thumb rest or Index trackpad, keep that trigger released, swing and release grip. Throw direction follows your gaze. Holding the trigger selects striking instead of touch-assisted throwing; grip release alone does not create a strike.");
+        Note(4,"Fists and melee items: hold the corresponding grip and swing to strike. Hold grip + that hand's trigger to charge, then swing while still holding both. Trigger release alone cancels the charge. Left/right fists work independently. Separate swings can repeat without releasing the buttons; let the hand slow between strokes. Both grips maintain guard when native combat allows it and restore it after attacks/hits. With empty hands, fully squeeze both grips into combat readiness and click the RIGHT stick to push an eligible nearby enemy. With a held item, right stick click still holsters. Release the click before pushing again.");
         Note(4,"Firearms start in melee mode. Tap the left trigger to toggle shooting/melee. In shooting mode, hold right grip and use the right trigger to fire along the weapon. In melee mode, right grip + swing strikes; adding right trigger charges the physical strike. Right stick click returns to fists.");
         Note(4,"WHIP AND SCRIPTED ACTIONS",true);
         Note(4,"With empty hands, reach over your right shoulder and squeeze right grip to draw the whip. Hold grip to keep it equipped; swing to crack toward the gaze target. Release grip to stow. When attached at a supported anchor, keep grip held and press right trigger for Whip-Yank. This shortcut does not apply while climbing or swinging.");
@@ -266,7 +266,7 @@ sealed class Launcher : Window {
         Note(4,"Photo camera: left trigger opens the viewfinder, right trigger takes a photo; left/right grips zoom out/in. Viewfinder and targeting follow head pitch as well as yaw. Magnifier inspection also follows your full look direction. Ordinary HUD stays level and follows horizontal head turns with a deadzone and soft catch-up.");
         Note(4,"FALLBACK CONTROLS",true);
         Note(4,"Hold Y: X = native use/confirm; A = native RT contextual action (including reload where supported); B = quick-inventory left; left/right triggers = native LB/RB (block/whip); right stick = D-pad; right/left stick clicks = native RS/Y. Y + left grip exposes native sticks, analog triggers, X/A/B and stick clicks for scripted prompts. Release modifiers and held controls before returning to normal play.");
-        Note(4,"Quest cosmetic gesture: unarmed, hold grip with your thumb on that handâ€™s thumb rest, then pull its trigger to extend the middle finger. Physical strikes remain available. Index has no equivalent cosmetic binding. Index mappings and untested story contexts still need hardware/gameplay validation.");
+        Note(4,"Quest cosmetic gesture: unarmed, hold grip with your thumb on that hand's thumb rest, then pull its trigger to extend the middle finger. Physical strikes remain available. Index has no equivalent cosmetic binding. Index mappings and untested story contexts still need hardware/gameplay validation.");
         status=new TextBlock {Text="Ready",ToolTip=SettingsPath,Foreground=muted,FontSize=11,VerticalAlignment=VerticalAlignment.Bottom,TextTrimming=TextTrimming.CharacterEllipsis,Margin=new Thickness(3,0,16,0)};
         var actions=new Grid(); actions.ColumnDefinitions.Add(new ColumnDefinition {Width=new GridLength(110)});actions.ColumnDefinitions.Add(new ColumnDefinition());actions.ColumnDefinitions.Add(new ColumnDefinition {Width=new GridLength(220)});
         var logs=Button("Open Logs",(s,e)=>Safe(()=>{Directory.CreateDirectory(Path.Combine(root,"logs"));Process.Start(new ProcessStartInfo(Path.Combine(root,"logs")){UseShellExecute=true});}));
@@ -291,7 +291,7 @@ sealed class Launcher : Window {
         // Vulkan device independently. Unknown inventory must not imply zero VRAM.
         bool vramWarningShown=false;
         Loaded+=(s,e)=>{if(!preview&&!vramWarningShown&&gpu.LowVram){vramWarningShown=true;
-            MessageBox.Show(this,GpuInfo.LowVramWarning,"KHARVOX: CIRCLE — VRAM",MessageBoxButton.OK,MessageBoxImage.Warning);}};
+            MessageBox.Show(this,GpuInfo.LowVramWarning,"KHARVOX: CIRCLE \u2014 VRAM",MessageBoxButton.OK,MessageBoxImage.Warning);}};
         ShowTab(0); loading=false; UpdateAvailability();
         // Persist refreshed discovery on every start. Verification stays read-only.
         if(!preview && installations.Length>0)Save();
@@ -522,7 +522,7 @@ sealed class Launcher : Window {
         var s=new Style(typeof(CheckBox));s.Setters.Add(new Setter(Control.ForegroundProperty,Brushes.White));s.Setters.Add(new Setter(Control.VerticalContentAlignmentProperty,VerticalAlignment.Center));
         var t=new ControlTemplate(typeof(CheckBox));var panel=new FrameworkElementFactory(typeof(StackPanel));panel.SetValue(StackPanel.OrientationProperty,Orientation.Horizontal);
         var box=new FrameworkElementFactory(typeof(Border),"Box");box.SetValue(FrameworkElement.WidthProperty,20.0);box.SetValue(FrameworkElement.HeightProperty,20.0);box.SetValue(FrameworkElement.VerticalAlignmentProperty,VerticalAlignment.Center);box.SetValue(Border.BorderThicknessProperty,new Thickness(1));box.SetValue(Border.BorderBrushProperty,new SolidColorBrush(Color.FromRgb(62,62,66)));box.SetValue(Border.BackgroundProperty,Brushes.Black);
-        var mark=new FrameworkElementFactory(typeof(TextBlock),"Mark");mark.SetValue(TextBlock.TextProperty,"âœ“");mark.SetValue(TextBlock.FontSizeProperty,16.0);mark.SetValue(TextBlock.ForegroundProperty,Brushes.White);mark.SetValue(FrameworkElement.HorizontalAlignmentProperty,HorizontalAlignment.Center);mark.SetValue(UIElement.VisibilityProperty,Visibility.Hidden);box.AppendChild(mark);panel.AppendChild(box);
+        var mark=new FrameworkElementFactory(typeof(TextBlock),"Mark");mark.SetValue(TextBlock.TextProperty,"\u2713");mark.SetValue(TextBlock.FontSizeProperty,16.0);mark.SetValue(TextBlock.ForegroundProperty,Brushes.White);mark.SetValue(FrameworkElement.HorizontalAlignmentProperty,HorizontalAlignment.Center);mark.SetValue(UIElement.VisibilityProperty,Visibility.Hidden);box.AppendChild(mark);panel.AppendChild(box);
         var content=new FrameworkElementFactory(typeof(ContentPresenter));content.SetValue(FrameworkElement.MarginProperty,new Thickness(14,0,0,0));content.SetValue(FrameworkElement.VerticalAlignmentProperty,VerticalAlignment.Center);panel.AppendChild(content);t.VisualTree=panel;
         var on=new Trigger {Property=System.Windows.Controls.Primitives.ToggleButton.IsCheckedProperty,Value=true};on.Setters.Add(new Setter(Border.BackgroundProperty,accent,"Box"));on.Setters.Add(new Setter(Border.BorderBrushProperty,accent,"Box"));on.Setters.Add(new Setter(UIElement.VisibilityProperty,Visibility.Visible,"Mark"));t.Triggers.Add(on);s.Setters.Add(new Setter(Control.TemplateProperty,t));return s;
     }
@@ -537,7 +537,7 @@ sealed class Launcher : Window {
  <Setter Property='Template'><Setter.Value><ControlTemplate TargetType='{x:Type ComboBox}'>
   <Grid>
    <ToggleButton Focusable='False' IsChecked='{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}' ClickMode='Press'>
-    <ToggleButton.Template><ControlTemplate TargetType='{x:Type ToggleButton}'><Border Background='Black' BorderBrush='#3E3E42' BorderThickness='1'><TextBlock Text='âŒ„' Foreground='#F5F5F5' HorizontalAlignment='Right' VerticalAlignment='Center' Margin='0,0,10,2'/></Border></ControlTemplate></ToggleButton.Template>
+    <ToggleButton.Template><ControlTemplate TargetType='{x:Type ToggleButton}'><Border Background='Black' BorderBrush='#3E3E42' BorderThickness='1'><TextBlock Text='&#x2304;' Foreground='#F5F5F5' HorizontalAlignment='Right' VerticalAlignment='Center' Margin='0,0,10,2'/></Border></ControlTemplate></ToggleButton.Template>
    </ToggleButton>
    <ContentPresenter x:Name='SelectionContent' IsHitTestVisible='False' Content='{TemplateBinding SelectionBoxItem}' ContentTemplate='{TemplateBinding SelectionBoxItemTemplate}' Margin='10,5,28,5' VerticalAlignment='Center'/>
    <TextBox x:Name='PART_EditableTextBox' Visibility='Collapsed' Background='Black' Foreground='#F5F5F5' BorderThickness='0' Padding='0' Margin='10,5,28,5' VerticalContentAlignment='Center' IsReadOnly='{TemplateBinding IsReadOnly}'/>
@@ -582,7 +582,7 @@ sealed class Launcher : Window {
         if(Convert.ToString(defaults["vr_fg_multiplier"])!="auto-fixed"||
            Convert.ToBoolean(defaults["vr_performance_overlay"])||Convert.ToBoolean(defaults["vr_hands_only"])||
            !Convert.ToBoolean(defaults["vr_laser_sight"])||Convert.ToDouble(defaults["vr_smooth_turn_speed"])!=240||
-           Convert.ToDouble(defaults["vr_snap_angle"])!=60)throw new Exception("Beta 0.1 embedded first-start defaults mismatch.");
+           Convert.ToDouble(defaults["vr_snap_angle"])!=60)throw new Exception("Beta 0.2 embedded first-start defaults mismatch.");
         foreach(ulong size in new ulong[]{0,8UL<<30,10UL<<30})
             if(!new GpuInfo{DedicatedVramBytes=size}.LowVram)throw new Exception("Low VRAM warning missing.");
         foreach(ulong size in new ulong[]{(10UL<<30)+1,12UL<<30,16UL<<30,24UL<<30})
@@ -590,7 +590,7 @@ sealed class Launcher : Window {
         if(new GpuInfo().LowVram)throw new Exception("Unknown VRAM must not trigger a low-memory warning.");
         if(!Equals(options.Single(o=>o.Key=="vr_fg_multiplier").Default,"auto-fixed")||
            !Equals(options.Single(o=>o.Key=="vr_snap_angle").Default,60)||
-           !Equals(options.Single(o=>o.Key=="vr_smooth_turn_speed").Default,240))throw new Exception("Beta 0.1 fallback defaults mismatch.");
+           !Equals(options.Single(o=>o.Key=="vr_smooth_turn_speed").Default,240))throw new Exception("Beta 0.2 fallback defaults mismatch.");
         // Headless WPF template/selection check: never show or control a window.
         var perf=options.Single(o=>o.Key=="vr_performance_overlay");
         if(!Equals(perf.Default,false))throw new Exception("Performance overlay must default off.");
