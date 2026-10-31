@@ -121,3 +121,8 @@ fixtures/
 *.dylib
 *.egg-info/
 *.dist-info/
+
+# Local convenience entry points; use CircleLauncher.exe in releases.
+/Start-Launcher.cmd
+/Start-VR.cmd
+/Launch-Circle.ps1
